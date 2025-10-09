@@ -7,10 +7,10 @@
 #include <unistd.h>
 
 void *mythread(void *arg) {
-	pthread_detach(pthread_self());
-	sleep(1);
+	//pthread_detach(pthread_self());
+	sleep(10);
 	printf("mythread [%d %d %d]: Hello from mythread!\n", getpid(), getppid(), gettid());
-	pthread_exit(NULL);
+	//pthread_exit(NULL);
 }
 
 int main() {
@@ -25,14 +25,14 @@ int main() {
 		return -1;
 	}
 
-	// err = pthread_join(tid, NULL);
-    // if (err) {
-    //     printf("main: pthread_join() failed: %s\n", strerror(err));
-    //     return -1;
-    // }
+	err = pthread_join(tid, NULL);
+    if (err) {
+        printf("main: pthread_join() failed: %s\n", strerror(err));
+        return -1;
+    }
 	
-	pthread_exit(NULL);
-	printf("123\n");
+	// pthread_exit(NULL);
+	// printf("123\n");
 	return 0;
 }
 

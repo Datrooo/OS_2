@@ -39,6 +39,7 @@ void *mythread(void *arg) {
     global_var += thread_num * 10;
 
     printf("[%d] AFTER: local = %d, global_var = %d\n\n", thread_num, local, global_var);
+    //sleep(10000);
 
     return NULL;
 }
