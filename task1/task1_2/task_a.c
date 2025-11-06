@@ -6,6 +6,7 @@
 
 void* thread_function(void* arg) {
     sleep(2);
+    printf("abacaba");
     return NULL;
 }
 
