@@ -6,10 +6,19 @@
 
 void* thread_func(void* arg) {
     (void)arg;
+    // int err;
+    // err = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    // if (err) {
+    //     printf("failed to set cancel type");
+    //     pthread_exit(NULL);
+    // }
+    long long counter = 0;
+
     while (1) {
-        printf("Thread is running...\n");
-        // sleep(1);
+        counter++;
+        // spthread_testcancel();
     }
+
     return NULL;
 }
 
@@ -36,7 +45,7 @@ int main() {
         printf("main: pthread_join() failed: %s\n", strerror(err));
         return 1;
     }
-    
+
     if (res == PTHREAD_CANCELED) {
         printf("thread was canceled\n");
     }

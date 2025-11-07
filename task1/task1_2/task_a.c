@@ -5,6 +5,7 @@
 #include <string.h>
 
 void* thread_function(void* arg) {
+    (void)arg;
     sleep(2);
     printf("abacaba");
     return NULL;

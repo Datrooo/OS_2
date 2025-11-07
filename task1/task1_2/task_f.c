@@ -5,6 +5,7 @@
 #include <string.h>
 
 void* thread_function(void* arg) {
+    (void)arg;
     printf("Thread started, id = %lu\n", pthread_self());
     pthread_exit(NULL);
 }

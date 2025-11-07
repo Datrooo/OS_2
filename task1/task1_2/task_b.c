@@ -5,6 +5,7 @@
 #include <string.h>
 
 void* thread_function(void* arg) {
+    (void)arg;
     static int result = 42;
     sleep(2);
     return &result;

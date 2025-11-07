@@ -5,6 +5,7 @@
 #include <string.h>
 
 void* mythread_string(void* arg) {
+    (void)arg;
 	char* string = "Hello world!\n";
 	sleep(2);
 	return (void*)string;

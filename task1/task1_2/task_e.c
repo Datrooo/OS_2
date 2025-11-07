@@ -5,6 +5,7 @@
 #include <string.h>
 
 void* thread_function(void* arg) {
+    (void)arg;
     int err = pthread_detach(pthread_self());
     if (err) {
         printf("thread: pthread_detach() failed: %s\n", strerror(err));

@@ -7,10 +7,12 @@
 #include <unistd.h>
 
 void *mythread(void *arg) {
+	(void)arg;
 	//pthread_detach(pthread_self());
 	sleep(10);
 	printf("mythread [%d %d %d]: Hello from mythread!\n", getpid(), getppid(), gettid());
 	//pthread_exit(NULL);
+	return NULL;
 }
 
 int main() {

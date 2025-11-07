@@ -4,12 +4,36 @@
 #include <unistd.h>
 #include <string.h>
 
+#define LEN_OF_STR 12
+
+void cleanup(void* arg) {
+    char** str = (char**)arg;
+    if(!*str) {
+        printf("memory alloca...\n");
+        return;
+    }
+    printf("Cleaning up: freeing memory...\n");
+    free(*str);
+}
+
 void* thread_func(void* arg) {
     (void)arg;
-    while (1) {
-        printf("Thread is running...\n");
-        // sleep(1);
+    char* str = NULL;
+    pthread_cleanup_push(cleanup, &str);
+    str = malloc(LEN_OF_STR * sizeof(char));
+    if (!str) {
+        perror("malloc error");
+        pthread_exit(NULL);
     }
+    strcpy(str, "hello world");
+
+
+    while (1) {
+        printf("%s\n", str);
+        sleep(1);
+    }
+
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -36,7 +60,7 @@ int main() {
         printf("main: pthread_join() failed: %s\n", strerror(err));
         return 1;
     }
-    
+
     if (res == PTHREAD_CANCELED) {
         printf("thread was canceled\n");
     }
