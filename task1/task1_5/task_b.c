@@ -7,12 +7,12 @@
 
 void handler_A(int sig) {
     (void)sig;
-    write(1, "Handler A (expected? no)\n", 25);
+    write(1, "Handler A win\n", 15);
 }
 
 void handler_B(int sig) {
     (void)sig;
-    write(1, "Handler B (global, wins)\n", 25);
+    write(1, "Handler B wins\n", 16);
 }
 
 static void *t2_set_A(void *arg) {
@@ -23,7 +23,10 @@ static void *t2_set_A(void *arg) {
     struct sigaction sa = {0};
     sa.sa_handler = handler_A;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGUSR1, &sa, NULL);
+    if (sigaction(SIGUSR1, &sa, NULL) == -1) {
+        perror("sigaction");
+        pthread_exit(NULL);
+    }
     write(1, "T2: installed handler A for SIGUSR1\n", 36);
 
     for (;;) pause();
@@ -39,7 +42,10 @@ static void *t3_set_B(void *arg) {
     struct sigaction sb = {0};
     sb.sa_handler = handler_B;
     sigemptyset(&sb.sa_mask);
-    sigaction(SIGUSR1, &sb, NULL);
+    if (sigaction(SIGUSR1, &sb, NULL) == -1) {
+        perror("sigaction");
+        pthread_exit(NULL);
+    }
     write(1, "T3: installed handler B for SIGUSR1 (overrides A)\n", 51);
 
     for (;;) pause();
@@ -69,7 +75,7 @@ int main(void) {
     sleep(2);
 
     write(1, "main: sending SIGUSR1 to T2\n", 28);
-    err = pthread_kill(t2, SIGUSR1); // ожидаем, что сработает B, а не A
+    err = pthread_kill(t2, SIGUSR1);
     if (err) {
         printf("main: failed to send signal\n");
         return 1;
@@ -81,7 +87,4 @@ int main(void) {
         printf("main: failed to send signal\n");
         return 1;
     }
-
-    for (;;)
-        sleep(10);
 }
