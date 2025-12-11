@@ -7,77 +7,23 @@
 void *qmonitor(void *arg)
 {
     queue_t *q = (queue_t *)arg;
+	int err;
+	printf("qmonitor: [%d %d %d]\n", getpid(), getppid(), gettid());
 
-    printf("qmonitor: [%d %d %d]\n",
-           getpid(), getppid(), gettid());
-
-    while (1) {
-        struct timespec ts;
-        int rc;
-
-        rc = clock_gettime(CLOCK_REALTIME, &ts);
-        if (rc != 0) {
-            perror("qmonitor: clock_gettime failed");
-            sleep(MONITOR_INTERVAL);
-            pthread_testcancel();
-            continue;
-        }
-        ts.tv_sec += MONITOR_INTERVAL;
-
-        int old_state;
-        rc = pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
-        if (rc != 0) {
-            fprintf(stderr,
-                    "qmonitor: pthread_setcancelstate(DISABLE) failed: %s\n",
-                    strerror(rc));
-        }
-
-        rc = pthread_mutex_lock(&q->lock);
-        if (rc != 0) {
-            fprintf(stderr,
-                    "qmonitor: pthread_mutex_lock failed: %s\n",
-                    strerror(rc));
-            int rc2 = pthread_setcancelstate(old_state, NULL);
-            if (rc2 != 0) {
-                fprintf(stderr,
-                        "qmonitor: pthread_setcancelstate(restore) failed: %s\n",
-                        strerror(rc2));
-            }
-            pthread_exit(NULL);
-        }
-
-        rc = pthread_cond_timedwait(&q->cond, &q->lock, &ts);
-        if (rc != 0 && rc != ETIMEDOUT) {
-            fprintf(stderr,
-                    "qmonitor: pthread_cond_timedwait failed: %s\n",
-                    strerror(rc));
-        }
-
-        rc = pthread_mutex_unlock(&q->lock);
-        if (rc != 0) {
-            fprintf(stderr,
-                    "qmonitor: pthread_mutex_unlock failed: %s\n",
-                    strerror(rc));
-            int rc2 = pthread_setcancelstate(old_state, NULL);
-            if (rc2 != 0) {
-                fprintf(stderr,
-                        "qmonitor: pthread_setcancelstate(restore) failed: %s\n",
-                        strerror(rc2));
-            }
-            pthread_exit(NULL);
-        }
-
-        rc = pthread_setcancelstate(old_state, NULL);
-        if (rc != 0) {
-            fprintf(stderr,
-                    "qmonitor: pthread_setcancelstate(restore) failed: %s\n",
-                    strerror(rc));
-        }
-
+	while (1) {
+		err = pthread_mutex_lock(&q->lock);
+		if (err != SUCCESS) {
+			printf("qmonitor: pthread_mutex_lock failed: %s\n", strerror(err));
+			continue;
+		}
         queue_print_stats(q);
-        pthread_testcancel();
-    }
-    return NULL;
+        err = pthread_mutex_unlock(&q->lock);
+		if (err != SUCCESS)
+			printf("qmonitor: pthread_mutex_unlock failed: %s\n", strerror(err));
+		sleep(MONITOR_INTERVAL);
+	}
+
+	return NULL;
 }
 
 queue_t *queue_init(int max_count)
@@ -206,6 +152,7 @@ int queue_add(queue_t *q, int val)
     q->add_count++;
 
     pthread_cond_signal(&q->cond);
+    pthread_cond_signal(&q->cond_monitor);
 
     pthread_mutex_unlock(&q->lock);
     pthread_setcancelstate(old_state, NULL);
@@ -245,6 +192,7 @@ int queue_get(queue_t *q, int *val)
 
 
     pthread_cond_signal(&q->cond);
+    pthread_cond_signal(&q->cond_monitor);
 
     pthread_mutex_unlock(&q->lock);
     pthread_setcancelstate(old_state, NULL);
