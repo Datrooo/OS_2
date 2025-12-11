@@ -200,27 +200,9 @@ int queue_get(queue_t *q, int *val)
     return QUEUE_OP_SUCCESS;
 }
 
-void queue_print_stats(queue_t *q)
-{
-    if (!q) return;
-
-    pthread_mutex_lock(&q->lock);
-
-    long add_attempts = q->add_attempts;
-    long get_attempts = q->get_attempts;
-    long add_count    = q->add_count;
-    long get_count    = q->get_count;
-    int  size         = q->count;
-
-    pthread_mutex_unlock(&q->lock);
-
-    printf("queue stats: current size %d; attempts: (%ld %ld %ld); "
-           "counts (%ld %ld %ld)\n",
-           size,
-           add_attempts,
-           get_attempts,
-           add_attempts - get_attempts,
-           add_count,
-           get_count,
-           add_count - get_count);
+void queue_print_stats(queue_t *q) {
+	printf("queue stats: current size %d; attempts: (%ld %ld %ld); counts (%ld %ld %ld)\n",
+		q->count,
+		q->add_attempts, q->get_attempts, q->add_attempts - q->get_attempts,
+		q->add_count, q->get_count, q->add_count -q->get_count);
 }
