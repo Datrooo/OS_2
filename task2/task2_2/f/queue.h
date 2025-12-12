@@ -13,7 +13,7 @@
 #define ERROR -1
 #define QUEUE_OP_SUCCESS 1
 #define QUEUE_OP_FAILURE 0
-#define MONITOR_INTERVAL 10
+#define MONITOR_INTERVAL 1
 
 typedef struct _QueueNode
 {
@@ -29,8 +29,7 @@ typedef struct _Queue
 	pthread_t qmonitor_tid;
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
-    pthread_cond_t cond_monitor;
-    	
+	pthread_cond_t cond_monitor;
 
 	int count;
 	int max_count;

@@ -12,7 +12,7 @@
 
 #define RED "\033[41m"
 #define NOCOLOR "\033[0m"
-#define QUEUE_SIZE 10000
+#define QUEUE_SIZE 1000000
 #define SLEEP_TIME 10
 
 #define CANCEL_AND_JOIN(thread, name) do { \
@@ -75,11 +75,11 @@ void *writer(void *arg) {
 		pthread_testcancel();
 		int ok = queue_add(q, i);
 		if (ok != QUEUE_OP_SUCCESS) {
-			//usleep(1);
+			usleep(1);
 			continue;
 		}
 		i++;
-		//usleep(1);
+		usleep(1);
 	}
 
 	return NULL;
