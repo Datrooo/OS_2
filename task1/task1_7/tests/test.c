@@ -6,7 +6,8 @@
 #include "uthread.h"
 #include "uthread_map.h"
 
-#define N_TASKS (3 * UTHREAD_WORKER_COUNT)
+#define N 4
+#define N_TASKS (3 * N)
 
 static int global_steps = 0;
 
@@ -29,9 +30,9 @@ static void *mapped_task(void *arg) {
 
 int main(void) {
     printf("[test_uthread_map_3_per_worker] start\n");
-    printf("Configured workers (UTHREAD_WORKER_COUNT) = %d\n", UTHREAD_WORKER_COUNT);
+    printf("Configured workers (UTHREAD_WORKER_COUNT) = %d\n", N);
 
-    int rc = uthread_map_init();
+    int rc = uthread_map_init(N);
     assert(rc == 0);
 
     uthread_t tids[N_TASKS];

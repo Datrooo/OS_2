@@ -5,9 +5,9 @@
 #include <pthread.h>
 
 
-#define UTHREAD_WORKER_COUNT 4
+#define UTHREAD_WORKERS_MAX 64
 
-int uthread_map_init(void);
+int uthread_map_init(int worker_count);
 
 int uthread_map_create(uthread_t *thread,
                        void *(*start_routine)(void *),

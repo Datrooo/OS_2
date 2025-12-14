@@ -36,7 +36,15 @@ typedef struct worker {
     int stop;
 } worker_t;
 
-static worker_t workers[UTHREAD_WORKER_COUNT];
+typedef struct {
+    uthread_t local_id;
+    int global_id;
+} local_map_t;
+
+
+static worker_t *workers = NULL;
+static int workers_count = 0;
+
 static mapped_thread_t mapped_threads[MAX_THREADS];
 
 static pthread_mutex_t global_map_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -88,17 +96,6 @@ static void worker_enqueue_task(worker_t *w, worker_task_t *task) {
     }
 }
 
-static worker_task_t *worker_dequeue_task(worker_t *w) {
-    worker_task_t *t = w->queue_head;
-    if (t) {
-        w->queue_head = t->next;
-        if (w->queue_head == NULL) {
-            w->queue_tail = NULL;
-        }
-    }
-    return t;
-}
-
 static void *worker_main(void *arg) {
     int worker_id = (int)(long)arg;
     worker_t *w = &workers[worker_id];
@@ -114,87 +111,152 @@ static void *worker_main(void *arg) {
             break;
         }
 
-        worker_task_t *task = worker_dequeue_task(w);
+        worker_task_t *batch = w->queue_head;
+        w->queue_head = NULL;
+        w->queue_tail = NULL;
         pthread_mutex_unlock(&w->mutex);
 
-        if (!task) {
-            continue;
+        local_map_t locals[MAX_THREADS];
+        int nlocals = 0;
+
+        for (worker_task_t *t = batch; t != NULL; ) {
+            worker_task_t *next = t->next;
+
+            uthread_t local_id;
+            int rc = uthread_create(&local_id, t->start_routine, t->arg);
+            if (rc != 0) {
+                mapped_thread_t *mt = &mapped_threads[t->global_id];
+                pthread_mutex_lock(&mt->mutex);
+                mt->retval = NULL;
+                mt->finished = 1;
+                pthread_cond_broadcast(&mt->cond);
+                pthread_mutex_unlock(&mt->mutex);
+
+                free(t);
+                t = next;
+                continue;
+            }
+
+            locals[nlocals].local_id = local_id;
+            locals[nlocals].global_id = t->global_id;
+            nlocals++;
+
+            free(t);
+            t = next;
         }
 
-        int global_id = task->global_id;
-        void *(*start_routine)(void *) = task->start_routine;
-        void *arg_fn = task->arg;
+        if (nlocals > 0) {
+            uthread_run();
+        }
 
-        uthread_t local_id;
-        int rc = uthread_create(&local_id, start_routine, arg_fn);
-        if (rc != 0) {
-            mapped_thread_t *mt = &mapped_threads[global_id];
+        for (int i = 0; i < nlocals; ++i) {
+            void *res = NULL;
+            int rc = uthread_join(locals[i].local_id, &res);
+            if (rc != 0) {
+                res = NULL;
+            }
+
+            mapped_thread_t *mt = &mapped_threads[locals[i].global_id];
             pthread_mutex_lock(&mt->mutex);
-            mt->retval = NULL;
+            mt->retval = res;
             mt->finished = 1;
             pthread_cond_broadcast(&mt->cond);
             pthread_mutex_unlock(&mt->mutex);
-
-            free(task);
-            continue;
         }
-
-        uthread_run();
-
-        void *res = NULL;
-        rc = uthread_join(local_id, &res);
-        if (rc != 0) {
-            res = NULL;
-        }
-
-        mapped_thread_t *mt = &mapped_threads[global_id];
-        pthread_mutex_lock(&mt->mutex);
-        mt->retval = res;
-        mt->finished = 1;
-        pthread_cond_broadcast(&mt->cond);
-        pthread_mutex_unlock(&mt->mutex);
-
-        free(task);
     }
 
     return NULL;
 }
 
-int uthread_map_init(void) {
+int uthread_map_init(int worker_count) {
     if (map_initialized) {
         return 0;
     }
 
-    memset(mapped_threads, 0, sizeof(mapped_threads));
-
-    for (int i = 0; i < UTHREAD_WORKER_COUNT; ++i) {
-        worker_t *w = &workers[i];
-        w->queue_head = w->queue_tail = NULL;
-        w->stop = 0;
-
-        int err;
-        err = pthread_mutex_init(&w->mutex, NULL);
-        if (err != 0) {
-            errno = err;
-            return -1;
-        }
-        err = pthread_cond_init(&w->cond, NULL);
-        if (err != 0) {
-            errno = err;
-            return -1;
-        }
-
-        err = pthread_create(&w->thread, NULL, worker_main, (void *)(long)i);
-        if (err != 0) {
-            errno = err;
-            return -1;
-        }
+    if (worker_count <= 0 || worker_count > UTHREAD_WORKERS_MAX) {
+        errno = EINVAL;
+        return -1;
     }
 
-    atomic_store(&next_worker, 0);
-    map_initialized = 1;
-    return 0;
+    workers = calloc((size_t)worker_count, sizeof(*workers));
+    if (workers == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+    workers_count = worker_count;
+
+    int created = 0;
+    int failed = 0;
+    int saved_errno = 0;
+
+    for (int i = 0; i < workers_count; ++i) {
+        int rc = 0;
+
+        workers[i].queue_head = NULL;
+        workers[i].queue_tail = NULL;
+        workers[i].stop = 0;
+
+        rc = pthread_mutex_init(&workers[i].mutex, NULL);
+        if (rc != 0) {
+            failed = 1;
+            saved_errno = rc;
+            break;
+        }
+
+        rc = pthread_cond_init(&workers[i].cond, NULL);
+        if (rc != 0) {
+            failed = 1;
+            saved_errno = rc;
+            pthread_mutex_destroy(&workers[i].mutex);
+            break;
+        }
+
+        rc = pthread_create(&workers[i].thread, NULL, worker_main, (void *)(long)i);
+        if (rc != 0) {
+            failed = 1;
+            saved_errno = rc;
+            pthread_cond_destroy(&workers[i].cond);
+            pthread_mutex_destroy(&workers[i].mutex);
+            break;
+        }
+
+        created++;
+    }
+
+    if (!failed) {
+        map_initialized = 1;
+        return 0;
+    }
+
+    for (int j = 0; j < created; ++j) {
+        pthread_mutex_lock(&workers[j].mutex);
+        workers[j].stop = 1;
+        pthread_cond_broadcast(&workers[j].cond);
+        pthread_mutex_unlock(&workers[j].mutex);
+    }
+
+    for (int j = 0; j < created; ++j) {
+        pthread_join(workers[j].thread, NULL);
+        worker_task_t *t = workers[j].queue_head;
+        while (t) {
+            worker_task_t *n = t->next;
+            free(t);
+            t = n;
+        }
+        workers[j].queue_head = workers[j].queue_tail = NULL;
+        pthread_cond_destroy(&workers[j].cond);
+        pthread_mutex_destroy(&workers[j].mutex);
+    }
+
+    free(workers);
+    workers = NULL;
+    workers_count = 0;
+    map_initialized = 0;
+
+    errno = saved_errno ? saved_errno : EFAULT;
+    return -1;
 }
+
 
 int uthread_map_create(uthread_t *thread,
                        void *(*start_routine)(void *),
@@ -223,7 +285,7 @@ int uthread_map_create(uthread_t *thread,
         return -1;
     }
 
-    int worker_id = atomic_fetch_add(&next_worker, 1) % UTHREAD_WORKER_COUNT;
+    int worker_id = atomic_fetch_add(&next_worker, 1) % workers_count;
 
     if (init_mapped_entry(idx, worker_id) == -1) {
         pthread_mutex_unlock(&global_map_mutex);
@@ -299,7 +361,7 @@ void uthread_map_shutdown(void) {
         return;
     }
 
-    for (int i = 0; i < UTHREAD_WORKER_COUNT; ++i) {
+    for (int i = 0; i < workers_count; ++i) {
         worker_t *w = &workers[i];
         pthread_mutex_lock(&w->mutex);
         w->stop = 1;
@@ -307,12 +369,23 @@ void uthread_map_shutdown(void) {
         pthread_mutex_unlock(&w->mutex);
     }
 
-    for (int i = 0; i < UTHREAD_WORKER_COUNT; ++i) {
+    for (int i = 0; i < workers_count; ++i) {
         pthread_join(workers[i].thread, NULL);
         pthread_mutex_destroy(&workers[i].mutex);
         pthread_cond_destroy(&workers[i].cond);
+
+        worker_task_t *t = workers[i].queue_head;
+        while (t) {
+            worker_task_t *n = t->next;
+            free(t);
+            t = n;
+        }
+        workers[i].queue_head = workers[i].queue_tail = NULL;
     }
 
     map_initialized = 0;
+    free(workers);
+    workers = NULL;
+    workers_count = 0;
 }
 

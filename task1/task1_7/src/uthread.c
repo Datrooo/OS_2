@@ -8,6 +8,9 @@ static __thread int current_thread = -1;
 static __thread ucontext_t main_context;
 static __thread int scheduler_running = 0;
 
+static __thread int free_ids[MAX_THREADS];
+static __thread int free_top = 0;
+
 static void thread_wrapper(void) {
     thread_t *t = &threads[current_thread];
     
@@ -23,12 +26,14 @@ int uthread_create(uthread_t *thread, void *(*start_routine)(void *), void *arg)
         return -1;
     }
     
-    if (thread_count >= MAX_THREADS) {
-        errno = EAGAIN;
-        return -1;
+    int tid;
+    if (free_top > 0) {
+        tid = free_ids[--free_top];
+    } else {
+        if (thread_count >= MAX_THREADS) { errno = EAGAIN; return -1; }
+        tid = thread_count++;
     }
-    
-    int tid = thread_count++;
+
     thread_t *t = &threads[tid];
     
     t->id = tid;
@@ -72,6 +77,23 @@ void uthread_sleep(int seconds) {
     uthread_yield();
 }
 
+#define UTHREAD_SLEEP_CHECK 10000
+
+static void uthread_wait_for_wakeup(void) {
+    while (1) {
+        time_t now = time(NULL);
+        for (int i = 0; i < thread_count; i++) {
+            if (threads[i].state == THREAD_SLEEPING &&
+                threads[i].wake_time <= now) {
+                threads[i].state = THREAD_READY;
+                return;
+            }
+        }
+        usleep(UTHREAD_SLEEP_CHECK);
+    }
+}
+
+
 void uthread_yield(void) {
     if (!scheduler_running || current_thread == -1) {
         return;
@@ -110,13 +132,7 @@ void uthread_yield(void) {
 
         if (!sleeping) break;
 
-        usleep(10000);
-        now = time(NULL);
-        for (int i = 0; i < thread_count; i++) {
-            if (threads[i].state == THREAD_SLEEPING && threads[i].wake_time <= now) {
-                threads[i].state = THREAD_READY;
-            }
-        }
+        uthread_wait_for_wakeup();
     }
     
     if (next == -1) {
@@ -165,7 +181,9 @@ int uthread_join(uthread_t thread, void **retval) {
     }
     
     free(t->stack);
+    
     t->stack = NULL;
+    free_ids[free_top++] = thread;
     
     return 0;
 }
