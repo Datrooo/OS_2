@@ -17,7 +17,9 @@ TEST_REUSE = $(BUILD_DIR)/test_reuse
 TEST_UTHREAD_ERRORS = $(BUILD_DIR)/test_uthread_errors
 TEST_UTHREAD_MAP_ERRORS = $(BUILD_DIR)/test_uthread_map_errors
 
-all: $(LIB_UTHREAD) $(LIB_UTHREAD_MAP) $(TEST_UTHREAD) $(TEST) $(TEST_REUSE) $(TEST_UTHREAD_ERRORS) $(TEST_UTHREAD_MAP_ERRORS)
+TEST_SLEEP = $(BUILD_DIR)/test_sleep
+
+all: $(LIB_UTHREAD) $(LIB_UTHREAD_MAP) $(TEST_UTHREAD) $(TEST) $(TEST_REUSE) $(TEST_UTHREAD_ERRORS) $(TEST_UTHREAD_MAP_ERRORS) $(TEST_SLEEP)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -50,6 +52,10 @@ $(TEST_UTHREAD_ERRORS): $(TEST_DIR)/test_uthread_errors.c $(LIB_UTHREAD)
 $(TEST_UTHREAD_MAP_ERRORS): $(TEST_DIR)/test_uthread_map_errors.c $(LIB_UTHREAD) $(LIB_UTHREAD_MAP)
 	$(CC) $(CFLAGS) $< -o $@ -L$(BUILD_DIR) -luthread -luthread_map
 
+
+$(TEST_SLEEP): $(TEST_DIR)/test_sleep.c $(LIB_UTHREAD) $(LIB_UTHREAD_MAP)
+	$(CC) $(CFLAGS) $< -o $@ -L$(BUILD_DIR) -luthread -luthread_map
+
 test:
 	@echo "Running test_uthread"
 	$(TEST_UTHREAD)
@@ -65,6 +71,9 @@ test:
 	@echo "#############################################################"
 	@echo "Running test_uthread_map_errors"
 	$(TEST_UTHREAD_MAP_ERRORS)
+	@echo "#############################################################"
+	@echo "Running test_sleep"
+	$(TEST_SLEEP)
 
 clean:
 	rm -rf $(BUILD_DIR)

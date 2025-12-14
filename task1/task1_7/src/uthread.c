@@ -89,7 +89,7 @@ static void uthread_wait_for_wakeup(void) {
                 return;
             }
         }
-        usleep(UTHREAD_SLEEP_CHECK);
+        //usleep(UTHREAD_SLEEP_CHECK);
     }
 }
 
