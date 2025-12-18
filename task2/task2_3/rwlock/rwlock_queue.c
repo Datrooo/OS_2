@@ -27,12 +27,11 @@ Node* create_node(const char* value) {
         strncpy(node->value, value, sizeof(node->value) - 1);
         node->value[sizeof(node->value) - 1] = '\0';
     } else {
-        node->value[0] = '\0'; // sentinel
+        node->value[0] = '\0';
     }
 
     node->next = NULL;
 
-    // rwlock init: attr=NULL -> default attrs [web:212]
     if (pthread_rwlock_init(&node->rwlock, NULL) != 0) {
         free(node);
         return NULL;
@@ -47,7 +46,7 @@ Storage* create_storage(int size) {
 
     storage->size = size;
 
-    storage->first = create_node(NULL); // sentinel-head
+    storage->first = create_node(NULL);
     if (!storage->first) {
         free(storage);
         return NULL;
@@ -83,7 +82,6 @@ void free_storage(Storage* storage) {
     while (current) {
         Node* next = current->next;
 
-        // destroy запрещён, если lock удерживается (иначе UB) [web:212]
         if (pthread_rwlock_destroy(&current->rwlock) != 0) {
             fprintf(stderr, "failed to destroy rwlock\n");
         }
@@ -95,16 +93,13 @@ void free_storage(Storage* storage) {
     free(storage);
 }
 
-// ---------------- readers ----------------
-// Важно: читающие потоки берут rdlock на узлы [web:21]
-
 void* find_rising_pairs(void* arg) {
     Storage* storage = (Storage*)arg;
 
     while (1) {
+        pthread_testcancel();
         int local_count = 0;
 
-        // чтобы безопасно прочитать first->next, берём rdlock на sentinel
         if (pthread_rwlock_rdlock(&storage->first->rwlock) != 0) continue;
 
         Node* current = storage->first->next;
@@ -134,15 +129,13 @@ void* find_rising_pairs(void* arg) {
             if (len1 < len2) local_count++;
 
             pthread_rwlock_unlock(&current->rwlock);
-            current = next_node; // next_node остаётся залоченным на чтение
+            current = next_node;
         }
 
         if (current) pthread_rwlock_unlock(&current->rwlock);
 
         atomic_fetch_add(&ascending_pairs, local_count);
         atomic_fetch_add(&iterations_count[0], 1);
-
-        usleep(1000);
     }
     return NULL;
 }
@@ -151,6 +144,7 @@ void* find_falling_pairs(void* arg) {
     Storage* storage = (Storage*)arg;
 
     while (1) {
+        pthread_testcancel();
         int local_count = 0;
 
         if (pthread_rwlock_rdlock(&storage->first->rwlock) != 0) continue;
@@ -189,8 +183,6 @@ void* find_falling_pairs(void* arg) {
 
         atomic_fetch_add(&descending_pairs, local_count);
         atomic_fetch_add(&iterations_count[1], 1);
-
-        usleep(1000);
     }
     return NULL;
 }
@@ -199,6 +191,7 @@ void* find_equal_pairs(void* arg) {
     Storage* storage = (Storage*)arg;
 
     while (1) {
+        pthread_testcancel();
         int local_count = 0;
 
         if (pthread_rwlock_rdlock(&storage->first->rwlock) != 0) continue;
@@ -237,133 +230,107 @@ void* find_equal_pairs(void* arg) {
 
         atomic_fetch_add(&equal_pairs, local_count);
         atomic_fetch_add(&iterations_count[2], 1);
-
-        usleep(1000);
     }
     return NULL;
 }
 
-// ---------------- writers (swap) ----------------
-// Писатели берут wrlock на prev/curr/next, т.к. меняют ссылки [web:21]
-
-static int perform_swap(Node* prev, Node* curr, Node* next, int swap_index) {
-    if (!prev || !curr || !next) return 0;
-
-    if (pthread_rwlock_wrlock(&prev->rwlock) != 0) return 0;
-
-    if (pthread_rwlock_wrlock(&curr->rwlock) != 0) {
-        pthread_rwlock_unlock(&prev->rwlock);
-        return 0;
-    }
-
-    if (pthread_rwlock_wrlock(&next->rwlock) != 0) {
-        pthread_rwlock_unlock(&curr->rwlock);
-        pthread_rwlock_unlock(&prev->rwlock);
-        return 0;
-    }
-
-    if (prev->next != curr || curr->next != next) {
-        pthread_rwlock_unlock(&next->rwlock);
-        pthread_rwlock_unlock(&curr->rwlock);
-        pthread_rwlock_unlock(&prev->rwlock);
-        return 0;
-    }
+static int perform_swap_wrlocked(Node* prev, Node* curr, Node* next, int swap_index) {
+    if (prev->next != curr || curr->next != next) return 0;
 
     curr->next = next->next;
     next->next = curr;
     prev->next = next;
 
     atomic_fetch_add(&swap_count[swap_index], 1);
+    return 1;
+}
 
-    pthread_rwlock_unlock(&next->rwlock);
-    pthread_rwlock_unlock(&curr->rwlock);
-    pthread_rwlock_unlock(&prev->rwlock);
+static int try_wrlock3(Node* prev, Node* curr, Node* next) {
+    if (pthread_rwlock_trywrlock(&prev->rwlock) != 0) return 0;
+
+    if (pthread_rwlock_trywrlock(&curr->rwlock) != 0) {
+        pthread_rwlock_unlock(&prev->rwlock);
+        return 0;
+    }
+
+    if (pthread_rwlock_trywrlock(&next->rwlock) != 0) {
+        pthread_rwlock_unlock(&curr->rwlock);
+        pthread_rwlock_unlock(&prev->rwlock);
+        return 0;
+    }
 
     return 1;
 }
 
-void* swap_thread_1(void* arg) {
+static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs) {
     Storage* storage = (Storage*)arg;
     unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
 
     while (1) {
-        Node* prev = storage->first;   // sentinel
-        Node* curr = prev->next;
-        int swapped = 0;
+        pthread_testcancel();
 
-        while (curr && curr->next && !swapped) {
-            Node* next = curr->next;
-
-            if (should_swap(&seed)) {
-                swapped = perform_swap(prev, curr, next, 0);
-                if (swapped) break;
-            }
-
-            prev = curr;
-            curr = next;
-        }
-
-        if (!swapped) usleep(2000);
-        else usleep(10000);
-    }
-    return NULL;
-}
-
-void* swap_thread_2(void* arg) {
-    Storage* storage = (Storage*)arg;
-    unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
-
-    while (1) {
         Node* prev = storage->first;
-        Node* curr = prev->next;
-        int swapped = 0;
+        if (pthread_rwlock_rdlock(&prev->rwlock) != 0) continue;
 
-        if (curr && curr->next) {
-            prev = curr;
-            curr = curr->next;
+        Node* curr = prev->next;
+        if (!curr) { pthread_rwlock_unlock(&prev->rwlock); continue; }
+
+        if (pthread_rwlock_rdlock(&curr->rwlock) != 0) {
+            pthread_rwlock_unlock(&prev->rwlock);
+            continue;
         }
 
-        while (curr && curr->next && !swapped) {
+        for (int k = 0; k < start_skip_pairs; k++) {
             Node* next = curr->next;
+            if (!next) break;
 
-            if (should_swap(&seed)) {
-                swapped = perform_swap(prev, curr, next, 1);
-                if (swapped) break;
-            }
+            if (pthread_rwlock_rdlock(&next->rwlock) != 0) break;
 
+            pthread_rwlock_unlock(&prev->rwlock);
             prev = curr;
             curr = next;
         }
 
-        if (!swapped) usleep(3000);
-        else usleep(15000);
-    }
-    return NULL;
-}
+        int did_swap = 0;
 
-void* swap_thread_3(void* arg) {
-    Storage* storage = (Storage*)arg;
-    unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
-
-    while (1) {
-        Node* prev = storage->first;
-        Node* curr = prev->next;
-        int swapped = 0;
-
-        while (curr && curr->next && !swapped) {
+        while (curr && curr->next) {
             Node* next = curr->next;
+            if (pthread_rwlock_rdlock(&next->rwlock) != 0) break;
 
             if (should_swap(&seed)) {
-                swapped = perform_swap(prev, curr, next, 2);
-                if (swapped) break;
+                pthread_rwlock_unlock(&next->rwlock);
+                pthread_rwlock_unlock(&curr->rwlock);
+                pthread_rwlock_unlock(&prev->rwlock);
+
+                if (!try_wrlock3(prev, curr, next)) {
+                    did_swap = 1;
+                    break;
+                }
+
+                (void)perform_swap_wrlocked(prev, curr, next, swap_index);
+
+                pthread_rwlock_unlock(&next->rwlock);
+                pthread_rwlock_unlock(&curr->rwlock);
+                pthread_rwlock_unlock(&prev->rwlock);
+
+                did_swap = 1;
+                break;
             }
 
+            pthread_rwlock_unlock(&prev->rwlock);
             prev = curr;
             curr = next;
         }
 
-        if (!swapped) usleep(4000);
-        else usleep(20000);
+        if (!did_swap) {
+            pthread_rwlock_unlock(&curr->rwlock);
+            pthread_rwlock_unlock(&prev->rwlock);
+        }
     }
     return NULL;
 }
+
+
+void* swap_thread_1(void* arg) { return swap_thread_common(arg, 0, 0); }
+void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 1); }
+void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 4); }

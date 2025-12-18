@@ -10,6 +10,8 @@
 void stop_threads(pthread_t search_threads[3],
                          pthread_t swap_threads[3],
                          int created_count) {
+    printf("hehehe");
+    fflush(stdout);
 
     for (int i = 0; i < created_count; i++) {
         pthread_t tid = (i < 3) ? search_threads[i] : swap_threads[i - 3];
@@ -79,6 +81,7 @@ int main(int argc, char** argv) {
         sleep(2);
         print_stats();
     }
+    printf("start free");
 
     stop_threads(search_threads, swap_threads, 6);
     free_storage(storage);

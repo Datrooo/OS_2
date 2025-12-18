@@ -82,7 +82,6 @@ void free_storage(Storage* storage) {
     Node* current = storage->first;
     while (current) {
         Node* next = current->next;
-        // destroy должен вызываться после остановки потоков
         if (pthread_mutex_destroy(&current->mutex) != 0) {
             fprintf(stderr, "failed to destroy mutex\n");
         }
@@ -98,6 +97,8 @@ void* find_rising_pairs(void* arg) {
     Storage* storage = (Storage*)arg;
 
     while (1) {
+        pthread_testcancel();
+
         int local_count = 0;
 
         if (pthread_mutex_lock(&storage->first->mutex) != 0) continue;
@@ -138,8 +139,6 @@ void* find_rising_pairs(void* arg) {
 
         atomic_fetch_add(&ascending_pairs, local_count);
         atomic_fetch_add(&iterations_count[0], 1);
-
-        usleep(1000);
     }
     return NULL;
 }
@@ -148,6 +147,8 @@ void* find_falling_pairs(void* arg) {
     Storage* storage = (Storage*)arg;
 
     while (1) {
+        pthread_testcancel();
+
         int local_count = 0;
 
         if (pthread_mutex_lock(&storage->first->mutex) != 0) continue;
@@ -186,8 +187,6 @@ void* find_falling_pairs(void* arg) {
 
         atomic_fetch_add(&descending_pairs, local_count);
         atomic_fetch_add(&iterations_count[1], 1);
-
-        usleep(1000);
     }
     return NULL;
 }
@@ -196,6 +195,8 @@ void* find_equal_pairs(void* arg) {
     Storage* storage = (Storage*)arg;
 
     while (1) {
+        pthread_testcancel();
+
         int local_count = 0;
 
         if (pthread_mutex_lock(&storage->first->mutex) != 0) continue;
@@ -234,131 +235,91 @@ void* find_equal_pairs(void* arg) {
 
         atomic_fetch_add(&equal_pairs, local_count);
         atomic_fetch_add(&iterations_count[2], 1);
-
-        usleep(1000);
     }
     return NULL;
 }
 
-int perform_swap(Node* prev, Node* curr, Node* next, int swap_index) {
-
-    if (!prev || !curr || !next) return 0;
-
-    if (pthread_mutex_lock(&prev->mutex) != 0) return 0;
-
-    if (pthread_mutex_lock(&curr->mutex) != 0) {
-        pthread_mutex_unlock(&prev->mutex);
-        return 0;
-    }
-
-    if (pthread_mutex_lock(&next->mutex) != 0) {
-        pthread_mutex_unlock(&curr->mutex);
-        pthread_mutex_unlock(&prev->mutex);
-        return 0;
-    }
-
-    if (prev->next != curr || curr->next != next) {
-        pthread_mutex_unlock(&next->mutex);
-        pthread_mutex_unlock(&curr->mutex);
-        pthread_mutex_unlock(&prev->mutex);
-        return 0;
-    }
+static int perform_swap_locked(Node* prev, Node* curr, Node* next, int swap_index) {
+    if (prev->next != curr || curr->next != next) return 0;
 
     curr->next = next->next;
     next->next = curr;
     prev->next = next;
 
     atomic_fetch_add(&swap_count[swap_index], 1);
-
-    pthread_mutex_unlock(&next->mutex);
-    pthread_mutex_unlock(&curr->mutex);
-    pthread_mutex_unlock(&prev->mutex);
-
     return 1;
 }
 
-void* swap_thread_1(void* arg) {
+static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs) {
     Storage* storage = (Storage*)arg;
     unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
 
     while (1) {
+        pthread_testcancel();
+
+        int did_swap = 0;
+
         Node* prev = storage->first;
+        if (pthread_mutex_lock(&prev->mutex) != 0) {
+            continue;
+        }
+
         Node* curr = prev->next;
-        int swapped = 0;
+        if (!curr) {
+            pthread_mutex_unlock(&prev->mutex);
+            continue;
+        }
 
-        while (curr && curr->next && !swapped) {
+        if (pthread_mutex_lock(&curr->mutex) != 0) {
+            pthread_mutex_unlock(&prev->mutex);
+            continue;
+        }
+
+        for (int k = 0; k < start_skip_pairs; k++) {
             Node* next = curr->next;
+            if (!next) break;
 
-            if (should_swap(&seed)) {
-                swapped = perform_swap(prev, curr, next, 0);
-                if (swapped) break;
+            if (pthread_mutex_lock(&next->mutex) != 0) {
+                break;
             }
 
+            pthread_mutex_unlock(&prev->mutex);
             prev = curr;
             curr = next;
         }
 
-        if (!swapped) usleep(2000);
-        else usleep(10000);
-    }
-    return NULL;
-}
-
-void* swap_thread_2(void* arg) {
-    Storage* storage = (Storage*)arg;
-    unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
-
-    while (1) {
-        Node* prev = storage->first;
-        Node* curr = prev->next;
-        int swapped = 0;
-
-        if (curr && curr->next) {
-            prev = curr;
-            curr = curr->next;
-        }
-
-        while (curr && curr->next && !swapped) {
+        while (curr && curr->next) {
             Node* next = curr->next;
 
-            if (should_swap(&seed)) {
-                swapped = perform_swap(prev, curr, next, 1);
-                if (swapped) break;
+            if (pthread_mutex_lock(&next->mutex) != 0) {
+                break;
             }
 
+            if (should_swap(&seed)) {
+                (void)perform_swap_locked(prev, curr, next, swap_index);
+
+                pthread_mutex_unlock(&next->mutex);
+                pthread_mutex_unlock(&curr->mutex);
+                pthread_mutex_unlock(&prev->mutex);
+
+                did_swap = 1;
+                break;
+            }
+
+            pthread_mutex_unlock(&prev->mutex);
             prev = curr;
             curr = next;
         }
 
-        if (!swapped) usleep(3000);
-        else usleep(15000);
-    }
-    return NULL;
-}
-
-void* swap_thread_3(void* arg) {
-    Storage* storage = (Storage*)arg;
-    unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
-
-    while (1) {
-        Node* prev = storage->first;
-        Node* curr = prev->next;
-        int swapped = 0;
-
-        while (curr && curr->next && !swapped) {
-            Node* next = curr->next;
-
-            if (should_swap(&seed)) {
-                swapped = perform_swap(prev, curr, next, 2);
-                if (swapped) break;
-            }
-
-            prev = curr;
-            curr = next;
+        if (!did_swap) {
+            pthread_mutex_unlock(&curr->mutex);
+            pthread_mutex_unlock(&prev->mutex);
         }
-
-        if (!swapped) usleep(4000);
-        else usleep(20000);
     }
+
     return NULL;
 }
+
+void* swap_thread_1(void* arg) { return swap_thread_common(arg, 0, 0); }
+void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 1); }
+void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 0); }
