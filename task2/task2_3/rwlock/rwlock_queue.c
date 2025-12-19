@@ -234,7 +234,108 @@ void* find_equal_pairs(void* arg) {
     return NULL;
 }
 
-static int perform_swap_wrlocked(Node* prev, Node* curr, Node* next, int swap_index) {
+// static int perform_swap_wrlocked(Node* prev, Node* curr, Node* next, int swap_index) {
+//     if (prev->next != curr || curr->next != next) return 0;
+
+//     curr->next = next->next;
+//     next->next = curr;
+//     prev->next = next;
+
+//     atomic_fetch_add(&swap_count[swap_index], 1);
+//     return 1;
+// }
+
+// static int try_wrlock3(Node* prev, Node* curr, Node* next) {
+//     if (pthread_rwlock_trywrlock(&prev->rwlock) != 0) return 0;
+
+//     if (pthread_rwlock_trywrlock(&curr->rwlock) != 0) {
+//         pthread_rwlock_unlock(&prev->rwlock);
+//         return 0;
+//     }
+
+//     if (pthread_rwlock_trywrlock(&next->rwlock) != 0) {
+//         pthread_rwlock_unlock(&curr->rwlock);
+//         pthread_rwlock_unlock(&prev->rwlock);
+//         return 0;
+//     }
+
+//     return 1;
+// }
+
+// static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs) {
+//     Storage* storage = (Storage*)arg;
+//     unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
+
+//     while (1) {
+//         pthread_testcancel();
+
+//         Node* prev = storage->first;
+//         if (pthread_rwlock_rdlock(&prev->rwlock) != 0) continue;
+
+//         Node* curr = prev->next;
+//         if (!curr) { pthread_rwlock_unlock(&prev->rwlock); continue; }
+
+//         if (pthread_rwlock_rdlock(&curr->rwlock) != 0) {
+//             pthread_rwlock_unlock(&prev->rwlock);
+//             continue;
+//         }
+
+//         for (int k = 0; k < start_skip_pairs; k++) {
+//             Node* next = curr->next;
+//             if (!next) break;
+
+//             if (pthread_rwlock_rdlock(&next->rwlock) != 0) break;
+
+//             pthread_rwlock_unlock(&prev->rwlock);
+//             prev = curr;
+//             curr = next;
+//         }
+
+//         int did_swap = 0;
+
+//         while (curr && curr->next) {
+//             Node* next = curr->next;
+//             if (pthread_rwlock_rdlock(&next->rwlock) != 0) break;
+
+//             if (should_swap(&seed)) {
+//                 pthread_rwlock_unlock(&next->rwlock);
+//                 pthread_rwlock_unlock(&curr->rwlock);
+//                 pthread_rwlock_unlock(&prev->rwlock);
+
+//                 if (!try_wrlock3(prev, curr, next)) {
+//                     did_swap = 1;
+//                     break;
+//                 }
+
+//                 (void)perform_swap_wrlocked(prev, curr, next, swap_index);
+
+//                 pthread_rwlock_unlock(&next->rwlock);
+//                 pthread_rwlock_unlock(&curr->rwlock);
+//                 pthread_rwlock_unlock(&prev->rwlock);
+
+//                 did_swap = 1;
+//                 break;
+//             }
+
+//             pthread_rwlock_unlock(&prev->rwlock);
+//             prev = curr;
+//             curr = next;
+//         }
+
+//         if (!did_swap) {
+//             pthread_rwlock_unlock(&curr->rwlock);
+//             pthread_rwlock_unlock(&prev->rwlock);
+//         }
+//     }
+//     return NULL;
+// }
+
+
+// void* swap_thread_1(void* arg) { return swap_thread_common(arg, 0, 0); }
+// void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 1); }
+// void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 4); }
+
+int perform_swap_wrlocked(Node* prev, Node* curr, Node* next, int swap_index) {
     if (prev->next != curr || curr->next != next) return 0;
 
     curr->next = next->next;
@@ -245,37 +346,22 @@ static int perform_swap_wrlocked(Node* prev, Node* curr, Node* next, int swap_in
     return 1;
 }
 
-static int try_wrlock3(Node* prev, Node* curr, Node* next) {
-    if (pthread_rwlock_trywrlock(&prev->rwlock) != 0) return 0;
-
-    if (pthread_rwlock_trywrlock(&curr->rwlock) != 0) {
-        pthread_rwlock_unlock(&prev->rwlock);
-        return 0;
-    }
-
-    if (pthread_rwlock_trywrlock(&next->rwlock) != 0) {
-        pthread_rwlock_unlock(&curr->rwlock);
-        pthread_rwlock_unlock(&prev->rwlock);
-        return 0;
-    }
-
-    return 1;
-}
-
-static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs) {
+void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs) {
     Storage* storage = (Storage*)arg;
     unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
 
     while (1) {
         pthread_testcancel();
 
+        int did_swap = 0;
+
         Node* prev = storage->first;
-        if (pthread_rwlock_rdlock(&prev->rwlock) != 0) continue;
+        if (pthread_rwlock_wrlock(&prev->rwlock) != 0) continue;
 
         Node* curr = prev->next;
         if (!curr) { pthread_rwlock_unlock(&prev->rwlock); continue; }
 
-        if (pthread_rwlock_rdlock(&curr->rwlock) != 0) {
+        if (pthread_rwlock_wrlock(&curr->rwlock) != 0) {
             pthread_rwlock_unlock(&prev->rwlock);
             continue;
         }
@@ -284,29 +370,19 @@ static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs)
             Node* next = curr->next;
             if (!next) break;
 
-            if (pthread_rwlock_rdlock(&next->rwlock) != 0) break;
+            if (pthread_rwlock_wrlock(&next->rwlock) != 0) break;
 
             pthread_rwlock_unlock(&prev->rwlock);
             prev = curr;
             curr = next;
         }
 
-        int did_swap = 0;
-
         while (curr && curr->next) {
             Node* next = curr->next;
-            if (pthread_rwlock_rdlock(&next->rwlock) != 0) break;
+
+            if (pthread_rwlock_wrlock(&next->rwlock) != 0) break;
 
             if (should_swap(&seed)) {
-                pthread_rwlock_unlock(&next->rwlock);
-                pthread_rwlock_unlock(&curr->rwlock);
-                pthread_rwlock_unlock(&prev->rwlock);
-
-                if (!try_wrlock3(prev, curr, next)) {
-                    did_swap = 1;
-                    break;
-                }
-
                 (void)perform_swap_wrlocked(prev, curr, next, swap_index);
 
                 pthread_rwlock_unlock(&next->rwlock);
@@ -327,10 +403,11 @@ static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs)
             pthread_rwlock_unlock(&prev->rwlock);
         }
     }
+
     return NULL;
 }
 
 
 void* swap_thread_1(void* arg) { return swap_thread_common(arg, 0, 0); }
-void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 1); }
-void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 4); }
+void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 5); }
+void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 10); }

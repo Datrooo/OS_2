@@ -239,7 +239,7 @@ void* find_equal_pairs(void* arg) {
     return NULL;
 }
 
-static int perform_swap_locked(Node* prev, Node* curr, Node* next, int swap_index) {
+int perform_swap_locked(Node* prev, Node* curr, Node* next, int swap_index) {
     if (prev->next != curr || curr->next != next) return 0;
 
     curr->next = next->next;
@@ -250,7 +250,7 @@ static int perform_swap_locked(Node* prev, Node* curr, Node* next, int swap_inde
     return 1;
 }
 
-static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs) {
+void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs) {
     Storage* storage = (Storage*)arg;
     unsigned seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
 
@@ -321,5 +321,5 @@ static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs)
 }
 
 void* swap_thread_1(void* arg) { return swap_thread_common(arg, 0, 0); }
-void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 1); }
-void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 0); }
+void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 5); }
+void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 10); }

@@ -137,8 +137,6 @@ void* find_rising_pairs(void* arg) {
 
         atomic_fetch_add(&ascending_pairs, local_count);
         atomic_fetch_add(&iterations_count[0], 1);
-
-        // usleep(1000);
     }
     return NULL;
 }
@@ -186,8 +184,6 @@ void* find_falling_pairs(void* arg) {
 
         atomic_fetch_add(&descending_pairs, local_count);
         atomic_fetch_add(&iterations_count[1], 1);
-
-        // usleep(1000);
     }
     return NULL;
 }
@@ -235,8 +231,6 @@ void* find_equal_pairs(void* arg) {
 
         atomic_fetch_add(&equal_pairs, local_count);
         atomic_fetch_add(&iterations_count[2], 1);
-
-        // usleep(1000);
     }
     return NULL;
 }
@@ -312,5 +306,5 @@ static void* swap_thread_common(void* arg, int swap_index, int start_skip_pairs)
 }
 
 void* swap_thread_1(void* arg) { return swap_thread_common(arg, 0, 0); }
-void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 1); }
-void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 0); }
+void* swap_thread_2(void* arg) { return swap_thread_common(arg, 1, 5); }
+void* swap_thread_3(void* arg) { return swap_thread_common(arg, 2, 10); }
