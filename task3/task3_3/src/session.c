@@ -1,8 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <errno.h> 
 
 #include "session.h"
+#include "cache.h"
 
 Session *session_new(int fd) {
     Session *s = (Session *)malloc(sizeof(Session));
@@ -54,7 +58,16 @@ int session_attach_entry(Session *s, CacheEntry *entry) {
     s->entry = entry;
     s->cursor = 0;
     
-    /* TODO: добавить в entry->subs */
+    SubNode *sub = (SubNode *)malloc(sizeof(SubNode));
+    if (!sub) return -1;
+    
+    sub->s = s;
+    sub->hh_next = entry->subs;
+    entry->subs = sub;
+    entry->subs_count++;
+    
+    fprintf(stdout, "[Session %lu] Attached to cache entry (ID: %lu, subscribers: %d)\n",
+            s->id, entry->id, entry->subs_count);
     
     return 0;
 }
@@ -62,7 +75,22 @@ int session_attach_entry(Session *s, CacheEntry *entry) {
 void session_detach_entry(Session *s) {
     if (!s || !s->entry) return;
     
-    /* TODO: удалить из entry->subs */
+    CacheEntry *entry = s->entry;
+    
+    SubNode **node = &entry->subs;
+    while (*node) {
+        if ((*node)->s == s) {
+            SubNode *tmp = *node;
+            *node = (*node)->hh_next;
+            free(tmp);
+            entry->subs_count--;
+            
+            fprintf(stdout, "[Session %lu] Detached from cache entry (ID: %lu, remaining: %d)\n",
+                    s->id, entry->id, entry->subs_count);
+            break;
+        }
+        node = &((*node)->hh_next);
+    }
     
     s->entry = NULL;
     s->cursor = 0;
@@ -71,7 +99,29 @@ void session_detach_entry(Session *s) {
 int session_send_response_header(Session *s, CacheEntry *entry) {
     if (!s || !entry) return -1;
     
-    /* TODO: отправить HTTP заголовок */
+    int status = cache_entry_get_status(entry);
+    const char *content_type = cache_entry_get_content_type(entry);
+    
+    char response[1024];
+    int len = snprintf(response, sizeof(response),
+        "HTTP/1.0 %d OK\r\n"
+        "Content-Type: %s\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        status > 0 ? status : 200,
+        content_type ? content_type : "text/html");
+    
+    if (len < 0 || len >= (int)sizeof(response)) {
+        return -1;
+    }
+    
+    ssize_t sent = send(s->fd, response, len, MSG_NOSIGNAL);
+    if (sent < 0) {
+        fprintf(stderr, "[Session %lu] Failed to send response header\n", s->id);
+        return -1;
+    }
+    
+    fprintf(stdout, "[Session %lu] Sent response header (%zd bytes)\n", s->id, sent);
     
     return 0;
 }
@@ -79,7 +129,39 @@ int session_send_response_header(Session *s, CacheEntry *entry) {
 int session_send_cached_data(Session *s) {
     if (!s || !s->entry) return -1;
     
-    /* TODO: отправить данные из кэша */
+    CacheEntry *entry = s->entry;
+    
+    uint8_t *data = NULL;
+    size_t size = 0;
+    
+    int result = cache_get_chunk(entry, s->cursor, &data, &size);
+    
+    if (result != 0) {
+        if (entry->is_completed) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+    
+    if (size == 0) {
+        return 0;
+    }
+    
+    ssize_t sent = send(s->fd, data, size, MSG_NOSIGNAL);
+    if (sent < 0) {
+        fprintf(stderr, "[Session %lu] Failed to send data\n", s->id);
+        return -1;
+    }
+    
+    s->cursor += sent;
+    
+    fprintf(stdout, "[Session %lu] Sent %zd bytes (cursor: %zu / %zu)\n",
+            s->id, sent, s->cursor, entry->produced);
+    
+    if (sent < (ssize_t)size) {
+        return 0;
+    }
     
     return 0;
 }

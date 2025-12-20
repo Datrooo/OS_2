@@ -6,7 +6,7 @@
 #include <pthread.h>
 #include <ev.h>
 
-
+// ключ кэша: "host:port/path?query"
 typedef struct {
     char  *s;      
     size_t len;
@@ -17,20 +17,19 @@ typedef struct {
     uint8_t *data;
 } Chunk;
 
-typedef Hash Hash;
-
 typedef struct SubNode {
     struct Session *s;
-    Hash hh;
+    SubNode *hh_next;
 } SubNode;
 
 typedef struct CacheEntry {
     CacheKey key;
+    uint64_t id;
     
     int in_map;
     int is_downloader_running;
     int is_completed;
-    int failed;
+    int is_failed;
     
     Chunk **chunks;
     int chunks_count;
@@ -42,23 +41,19 @@ typedef struct CacheEntry {
     char *content_type; 
     
     pthread_mutex_t m;
-    int dirty;
+    int is_dirty;
     
     SubNode *subs; 
     int subs_count;
     
-    struct CacheEntry *prev;
-    struct CacheEntry *next;
+    CacheEntry *lru_prev;
+    CacheEntry *lru_next;
+
+    CacheEntry *hash_next;
     size_t bytes_total;
     uint64_t access_time;         // для LRU
     
 } CacheEntry;
-
-typedef struct {
-    CacheKey key;
-    CacheEntry *entry;
-    Hash hh;
-} CacheNode;
 
 typedef enum {
     SESSION_REQ_RECV = 1,    // Читаем заголовок запроса
@@ -69,7 +64,8 @@ typedef enum {
 
 typedef struct Session {
     int fd;
-    struct ev_io read_w, write_w;
+    ev_io read_w;
+    ev_io write_w;
     
     // Состояние парсинга запроса 
     SessionState state;

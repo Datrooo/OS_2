@@ -23,4 +23,9 @@ void cache_remove_entry(CacheEntry *entry);
 
 void cache_cleanup(void);
 
-#endif 
+// otladka
+int cache_get_entry_count(void);
+size_t cache_get_total_size(void);
+void cache_print_stats(void);
+
+#endif
