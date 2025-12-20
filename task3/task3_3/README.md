@@ -107,6 +107,7 @@ Note: если при паре клиентов прокси улетает в 3
 29. Реализовывать TTL не обязательно
 30. Если запись уже есть в кэше, ходить на сервер и спрашивать last updated не
 обязательно
+---
 Список возможных сайтов с http 1.0(а может уже и нет)
 http://gramota.ru/ - словарь, есть редирект
 http://parallels.nsu.ru/WackoWiki/KursOperacionnyeSistemy/PraktikumPosixThreads/ —
