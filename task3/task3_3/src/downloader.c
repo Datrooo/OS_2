@@ -8,10 +8,11 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
+#include <stdint.h>
 
 #include "downloader.h"
 #include "cache.h"
-#include "loop.h"
+#include "dirty.h"
 
 #define DOWNLOADER_THREAD_COUNT 4
 #define DOWNLOADER_QUEUE_SIZE 1024
@@ -242,7 +243,7 @@ static void *downloader_worker(void *arg) {
             pthread_mutex_lock(&entry->m);
             entry->is_downloader_running = 0;
             pthread_mutex_unlock(&entry->m);
-            loop_notify_dirty();
+            dirty_enqueue(entry);
             continue;
         }
         
@@ -253,7 +254,7 @@ static void *downloader_worker(void *arg) {
             pthread_mutex_lock(&entry->m);
             entry->is_downloader_running = 0;
             pthread_mutex_unlock(&entry->m);
-            loop_notify_dirty();
+            dirty_enqueue(entry);
             continue;
         }
         
@@ -297,7 +298,11 @@ static void *downloader_worker(void *arg) {
                 cache_append_chunk(entry, buffer, n);
             }
             
-            loop_notify_dirty();
+            //Enqueue dirty (batch processing)
+            pthread_mutex_lock(&entry->m);
+            entry->is_dirty = 1;
+            pthread_mutex_unlock(&entry->m);
+            dirty_enqueue(entry);
         }
         
         if (header_parsed) {
@@ -316,7 +321,7 @@ static void *downloader_worker(void *arg) {
         entry->is_downloader_running = 0;
         pthread_mutex_unlock(&entry->m);
         
-        loop_notify_dirty();
+        dirty_enqueue(entry);
         
         fprintf(stdout, "[DL] Worker %d: Entry %lu completed (status: %d, %zu bytes)\n",
                 thread_id, entry->id, response_status, total_received);
@@ -326,8 +331,6 @@ static void *downloader_worker(void *arg) {
     
     return NULL;
 }
-
-
 
 int downloader_init(void) {
     if (g_downloader_initialized) {
