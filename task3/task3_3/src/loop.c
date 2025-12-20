@@ -5,6 +5,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <ev.h>
 
 #include "loop.h"
@@ -13,6 +15,8 @@
 #include "parse.h"
 #include "key_builder.h"
 #include "net.h"
+#include "downloader.h"
+
 
 static struct ev_loop *g_loop = NULL;
 static int g_listen_fd = -1;
@@ -50,7 +54,6 @@ static void session_list_remove(Session *s) {
 }
 
 static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
-    (void)loop;
     (void)w;
     (void)revents;
     
@@ -181,6 +184,19 @@ static void client_read_callback(struct ev_loop *loop, ev_io *w, int revents) {
         s->state = SESSION_ERROR;
         ev_io_stop(loop, &s->read_w);
         return;
+    }
+        
+    if (!entry->is_downloader_running && !entry->is_completed) {
+        fprintf(stdout, "[Session %lu] Enqueueing download task for entry %lu\n",
+                s->id, entry->id);
+        
+        if (downloader_enqueue(entry, 1) != 0) {
+            fprintf(stderr, "[Session %lu] Failed to enqueue download\n", s->id);
+        }
+        
+        pthread_mutex_lock(&entry->m);
+        entry->is_downloader_running = 1;
+        pthread_mutex_unlock(&entry->m);
     }
     
     fprintf(stdout, "[Session %lu] Parsed successfully, transitioning to STREAMING\n", s->id);

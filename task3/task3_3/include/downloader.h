@@ -3,10 +3,25 @@
 
 #include "types.h"
 
-int downloader_init(int pool_size);
+/* worker threads that:
+   1. Pop tasks from queue
+   2. Connect to origin server
+   3. Send HTTP/1.0 GET request
+   4. Stream response into cache via cache_append_chunk()
+   5. Mark complete via cache_entry_complete()
+    */
 
-int downloader_enqueue(CacheEntry *entry);
+typedef struct {
+    CacheEntry *entry;
+    int urgency;           /* 0 = background, 1 = on-demand (from client) */
+} DownloadTask;
+
+int downloader_init(void);
+
+int downloader_enqueue(CacheEntry *entry, int urgency);
 
 void downloader_shutdown(void);
+
+int downloader_get_queue_size(void);
 
 #endif
