@@ -39,6 +39,8 @@ typedef struct CacheEntry {
     
     int http_status;
     char *content_type; 
+    size_t content_length;
+
     
     pthread_mutex_t m;
     int is_dirty;
@@ -83,6 +85,10 @@ typedef struct Session {
     int read_active;
     int write_active;
     int closed;
+
+    int header_sent;
+    char *header_buf;
+    size_t header_len;
     
     uint64_t id;
 } Session;

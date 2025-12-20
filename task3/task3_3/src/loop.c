@@ -16,12 +16,14 @@
 #include "key_builder.h"
 #include "net.h"
 #include "downloader.h"
-
+#include "dirty.h"
+#include "stream.h"
 
 static struct ev_loop *g_loop = NULL;
 static int g_listen_fd = -1;
 static ev_io g_listen_watcher;
 static ev_async g_async_watcher;
+static ev_timer g_dirty_timer;
 
 static uint64_t g_session_counter = 0;
 
@@ -67,6 +69,29 @@ static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
         node = node->next;
     }
 }
+
+static void dirty_timer_callback(struct ev_loop *loop, ev_timer *w, int revents) {
+    (void)loop;
+    (void)w;
+    (void)revents;
+    
+    int processed = dirty_process_all();
+    
+    if (processed > 0) {
+        fprintf(stdout, "[LOOP] Dirty timer: processed %d entries\n", processed);
+        
+        SessionNode *node = g_sessions;
+        while (node) {
+            Session *s = node->sess;
+            if (s->state == SESSION_STREAMING && s->entry && !s->write_active) {
+                ev_io_start(loop, &s->write_w);
+                s->write_active = 1;
+            }
+            node = node->next;
+        }
+    }
+}
+
 
 static void client_read_callback(struct ev_loop *loop, ev_io *w, int revents) {
     (void)revents;
@@ -219,16 +244,22 @@ static void client_write_callback(struct ev_loop *loop, ev_io *w, int revents) {
     if (s->state == SESSION_STREAMING && s->entry) {
         CacheEntry *entry = s->entry;
         
-        if (s->cursor == 0 && entry->http_status > 0) {
-            if (session_send_response_header(s, entry) < 0) {
+        if (!s->header_sent) {
+            if (stream_send_header(s) < 0) {
+                fprintf(stderr, "[Session %lu] Failed to send header\n", s->id);
                 s->state = SESSION_ERROR;
                 ev_io_stop(loop, &s->write_w);
                 s->write_active = 0;
                 return;
             }
+            
+            if (!s->header_sent) {
+                // wait headder
+                return;
+            }
         }
         
-        int send_result = session_send_cached_data(s);
+        int send_result = stream_send_body(s);
         
         if (send_result < 0) {
             fprintf(stderr, "[Session %lu] Error sending data\n", s->id);
@@ -320,6 +351,9 @@ int loop_init(int listen_port) {
     
     ev_async_init(&g_async_watcher, async_callback);
     ev_async_start(g_loop, &g_async_watcher);
+    
+    ev_timer_init(&g_dirty_timer, dirty_timer_callback, 0.1, 0.1);
+    ev_timer_start(g_loop, &g_dirty_timer);
     
     return 0;
 }
