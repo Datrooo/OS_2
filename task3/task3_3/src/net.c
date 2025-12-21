@@ -12,7 +12,7 @@
 
 #define DEFAULT_PORT 80
 
-int net_listen(int port) {
+int net_listen_on(const char *bind_ip, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
         fprintf(stderr, "[NET] Socket creation failed: %s\n", strerror(errno));
@@ -29,7 +29,15 @@ int net_listen(int port) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (!bind_ip || bind_ip[0] == '\0' || strcmp(bind_ip, "0.0.0.0") == 0) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        if (inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) {
+            fprintf(stderr, "[NET] Invalid bind ip '%s'\n", bind_ip);
+            close(fd);
+            return -1;
+        }
+    }
     addr.sin_port = htons(port);
     
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -44,9 +52,16 @@ int net_listen(int port) {
         return -1;
     }
     
-    fprintf(stdout, "[NET] Listen socket created: fd=%d, port=%d\n", fd, port);
+        fprintf(stdout, "[NET] Listen socket created: fd=%d, %s:%d\n",
+            fd,
+            (!bind_ip || bind_ip[0] == '\0') ? "0.0.0.0" : bind_ip,
+            port);
     
     return fd;
+}
+
+int net_listen(int port) {
+    return net_listen_on(NULL, port);
 }
 
 int net_parse_host_port(const char *host_str, char **out_host, int *out_port) {

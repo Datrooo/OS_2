@@ -8,6 +8,8 @@
 #include "session.h"
 #include "cache.h"
 
+#define SESSION_HEADER_BUF_SIZE 2048
+
 Session *session_new(int fd) {
     Session *s = (Session *)malloc(sizeof(Session));
     if (!s) return NULL;
@@ -28,6 +30,13 @@ Session *session_new(int fd) {
     s->target = NULL;
     s->http_version = NULL;
     s->host = NULL;
+
+    s->header_sent = 0;
+    s->header_len = 0;
+    s->header_buf = (char *)malloc(SESSION_HEADER_BUF_SIZE);
+    if (s->header_buf) {
+        memset(s->header_buf, 0, SESSION_HEADER_BUF_SIZE);
+    }
     
     return s;
 }
@@ -44,6 +53,11 @@ void session_free(Session *s) {
     if (s->target) free(s->target);
     if (s->http_version) free(s->http_version);
     if (s->host) free(s->host);
+
+    if (s->header_buf) {
+        free(s->header_buf);
+        s->header_buf = NULL;
+    }
     
     if (s->entry) {
         session_detach_entry(s);
@@ -94,6 +108,14 @@ void session_detach_entry(Session *s) {
     
     s->entry = NULL;
     s->cursor = 0;
+
+    pthread_mutex_lock(&entry->m);
+    int should_remove = (entry->no_cache && entry->is_completed && entry->subs_count == 0);
+    pthread_mutex_unlock(&entry->m);
+
+    if (should_remove) {
+        cache_remove_entry(entry);
+    }
 }
 
 int session_send_response_header(Session *s, CacheEntry *entry) {

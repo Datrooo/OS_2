@@ -5,8 +5,7 @@
 
 /* 
     Downloader threads enqueue entries that have new data.
-    Event loop periodically processes the queue in batch.
-    Reduces context switches vs. calling loop_notify_dirty() every chunk.
+    Event loop processes the queue when notified via ev_async.
 */
 
 int dirty_init(void);

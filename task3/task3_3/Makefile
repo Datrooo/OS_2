@@ -3,7 +3,7 @@ CFLAGS = -Wall -Wextra -O2 -pthread -std=c99 -Iinclude
 LDFLAGS = -lev -lpthread
 
 SOURCES = src/main.c src/loop.c src/session.c src/cache.c src/key_builder.c \
-          src/net.c src/parse.c src/downloader.c src/gc.c
+          src/net.c src/parse.c src/downloader.c src/gc.c src/dirty.c src/stream.c src/subscribers.c
 
 OBJECTS = $(SOURCES:.c=.o)
 EXECUTABLE = proxy
@@ -20,7 +20,7 @@ clean:
 	rm -f $(OBJECTS) $(EXECUTABLE)
 
 run: $(EXECUTABLE)
-	./$(EXECUTABLE) 8080
+	./$(EXECUTABLE) 80
 
 debug: CFLAGS += -g -DDEBUG
 debug: clean $(EXECUTABLE)

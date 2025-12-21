@@ -19,11 +19,47 @@
 #include "dirty.h"
 #include "stream.h"
 
+static char *xstrdup(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *out = (char *)malloc(n);
+    if (!out) return NULL;
+    memcpy(out, s, n);
+    return out;
+}
+
+static char *normalize_target_origin_form(const char *target) {
+    if (!target || !target[0]) {
+        return xstrdup("/");
+    }
+
+    if (target[0] == '/') {
+        return xstrdup(target);
+    }
+
+    const char *p = NULL;
+    if (strncmp(target, "http://", 7) == 0) {
+        p = target + 7;
+    } else if (strncmp(target, "https://", 8) == 0) {
+        p = target + 8;
+    }
+
+    if (!p) {
+        return xstrdup(target);
+    }
+
+    const char *path = strchr(p, '/');
+    if (!path) {
+        return xstrdup("/");
+    }
+
+    return xstrdup(path);
+}
+
 static struct ev_loop *g_loop = NULL;
 static int g_listen_fd = -1;
 static ev_io g_listen_watcher;
 static ev_async g_async_watcher;
-static ev_timer g_dirty_timer;
 
 static uint64_t g_session_counter = 0;
 
@@ -58,40 +94,42 @@ static void session_list_remove(Session *s) {
 static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
     (void)w;
     (void)revents;
-    
+    int processed = dirty_process_all();
+    if (processed <= 0) {
+        return;
+    }
+
     SessionNode *node = g_sessions;
     while (node) {
         Session *s = node->sess;
         if (s->state == SESSION_STREAMING && s->entry && !s->write_active) {
-            ev_io_start(loop, &s->write_w);
-            s->write_active = 1;
+            int should_wake = 0;
+
+            pthread_mutex_lock(&s->entry->m);
+            int header_ready = s->entry->header_ready;
+            int completed = s->entry->is_completed;
+            pthread_mutex_unlock(&s->entry->m);
+
+            if (!s->header_sent && header_ready) {
+                should_wake = 1;
+            }
+
+            if (!should_wake && stream_can_send_more(s)) {
+                should_wake = 1;
+            } else if (!should_wake) {
+                should_wake = completed;
+            }
+
+            if (should_wake) {
+                ev_io_start(loop, &s->write_w);
+                s->write_active = 1;
+            }
         }
         node = node->next;
     }
 }
 
-static void dirty_timer_callback(struct ev_loop *loop, ev_timer *w, int revents) {
-    (void)loop;
-    (void)w;
-    (void)revents;
-    
-    int processed = dirty_process_all();
-    
-    if (processed > 0) {
-        fprintf(stdout, "[LOOP] Dirty timer: processed %d entries\n", processed);
-        
-        SessionNode *node = g_sessions;
-        while (node) {
-            Session *s = node->sess;
-            if (s->state == SESSION_STREAMING && s->entry && !s->write_active) {
-                ev_io_start(loop, &s->write_w);
-                s->write_active = 1;
-            }
-            node = node->next;
-        }
-    }
-}
-
+static void client_write_callback(struct ev_loop *loop, ev_io *w, int revents);
 
 static void client_read_callback(struct ev_loop *loop, ev_io *w, int revents) {
     (void)revents;
@@ -159,8 +197,22 @@ static void client_read_callback(struct ev_loop *loop, ev_io *w, int revents) {
     fprintf(stdout, "[Session %lu] Request: %s %s %s\n", s->id, method, target, http_version);
     
     s->method = method;
-    s->target = target;
+    char *normalized_target = normalize_target_origin_form(target);
+    free(target);
+    s->target = normalized_target;
     s->http_version = http_version;
+
+    if (!s->method || strcmp(s->method, "GET") != 0) {
+        static const char resp[] =
+            "HTTP/1.0 501 Not Implemented\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        (void)send(fd, resp, sizeof(resp) - 1, MSG_NOSIGNAL);
+        fprintf(stderr, "[Session %lu] Unsupported method: %s\n", s->id, s->method ? s->method : "(null)");
+        s->state = SESSION_ERROR;
+        ev_io_stop(loop, &s->read_w);
+        return;
+    }
     
     s->host = parse_host_header(s->reqbuf, headers_len);
     if (!s->host) {
@@ -183,7 +235,7 @@ static void client_read_callback(struct ev_loop *loop, ev_io *w, int revents) {
         *port_pos = ':';
     }
     
-    CacheKey *cache_key = build_cache_key(host_only, target, port);
+    CacheKey *cache_key = build_cache_key(host_only, s->target, port);
     if (!cache_key) {
         fprintf(stderr, "[Session %lu] Failed to build cache key\n", s->id);
         s->state = SESSION_ERROR;
@@ -243,6 +295,17 @@ static void client_write_callback(struct ev_loop *loop, ev_io *w, int revents) {
     
     if (s->state == SESSION_STREAMING && s->entry) {
         CacheEntry *entry = s->entry;
+
+        if (!s->header_sent) {
+            pthread_mutex_lock(&entry->m);
+            int header_ready = entry->header_ready;
+            pthread_mutex_unlock(&entry->m);
+            if (!header_ready) {
+                ev_io_stop(loop, &s->write_w);
+                s->write_active = 0;
+                return;
+            }
+        }
         
         if (!s->header_sent) {
             if (stream_send_header(s) < 0) {
@@ -288,6 +351,7 @@ static void client_write_callback(struct ev_loop *loop, ev_io *w, int revents) {
 }
 
 static void accept_callback(struct ev_loop *loop, ev_io *w, int revents) {
+    (void)w;
     (void)revents;
     
     struct sockaddr_in client_addr;
@@ -327,8 +391,8 @@ static void accept_callback(struct ev_loop *loop, ev_io *w, int revents) {
     session_list_add(s);
 }
 
-int loop_init(int listen_port) {
-    g_listen_fd = net_listen(listen_port);
+int loop_init(const char *bind_ip, int listen_port) {
+    g_listen_fd = net_listen_on(bind_ip, listen_port);
     if (g_listen_fd < 0) {
         fprintf(stderr, "Failed to create listen socket\n");
         return -1;
@@ -343,6 +407,7 @@ int loop_init(int listen_port) {
     if (!g_loop) {
         fprintf(stderr, "Failed to create event loop\n");
         close(g_listen_fd);
+        g_listen_fd = -1;
         return -1;
     }
     
@@ -351,9 +416,6 @@ int loop_init(int listen_port) {
     
     ev_async_init(&g_async_watcher, async_callback);
     ev_async_start(g_loop, &g_async_watcher);
-    
-    ev_timer_init(&g_dirty_timer, dirty_timer_callback, 0.1, 0.1);
-    ev_timer_start(g_loop, &g_dirty_timer);
     
     return 0;
 }
@@ -370,6 +432,21 @@ void loop_stop(void) {
     if (!g_loop) return;
     
     ev_break(g_loop, EVBREAK_ALL);
+}
+
+void loop_shutdown(void) {
+    if (g_loop) {
+        ev_async_stop(g_loop, &g_async_watcher);
+        ev_io_stop(g_loop, &g_listen_watcher);
+        ev_break(g_loop, EVBREAK_ALL);
+        ev_loop_destroy(g_loop);
+        g_loop = NULL;
+    }
+
+    if (g_listen_fd >= 0) {
+        close(g_listen_fd);
+        g_listen_fd = -1;
+    }
 }
 
 struct ev_loop *loop_get(void) {

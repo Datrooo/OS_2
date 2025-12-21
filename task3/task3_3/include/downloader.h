@@ -11,11 +11,6 @@
    5. Mark complete via cache_entry_complete()
     */
 
-typedef struct {
-    CacheEntry *entry;
-    int urgency;           /* 0 = background, 1 = on-demand (from client) */
-} DownloadTask;
-
 int downloader_init(void);
 
 int downloader_enqueue(CacheEntry *entry, int urgency);

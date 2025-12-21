@@ -49,12 +49,18 @@ int dirty_enqueue(CacheEntry *entry) {
     if (!entry) {
         return -1;
     }
+
+    if (!g_dirty_initialized) {
+        fprintf(stderr, "[DIRTY] dirty_enqueue() called before dirty_init()\n");
+        return -1;
+    }
     
     pthread_mutex_lock(&g_dirty_queue.m);
     
     for (int i = 0; i < g_dirty_queue.count; i++) {
         if (g_dirty_queue.entries[i] == entry) {
             pthread_mutex_unlock(&g_dirty_queue.m);
+            loop_notify_dirty();
             return 0;
         }
     }
@@ -70,6 +76,8 @@ int dirty_enqueue(CacheEntry *entry) {
     g_dirty_queue.entries[g_dirty_queue.count++] = entry;
     
     pthread_mutex_unlock(&g_dirty_queue.m);
+
+    loop_notify_dirty();
     
     return 0;
 }

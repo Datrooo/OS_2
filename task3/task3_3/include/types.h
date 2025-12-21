@@ -19,7 +19,7 @@ typedef struct {
 
 typedef struct SubNode {
     struct Session *s;
-    SubNode *hh_next;
+    struct SubNode *hh_next;
 } SubNode;
 
 typedef struct CacheEntry {
@@ -41,6 +41,12 @@ typedef struct CacheEntry {
     char *content_type; 
     size_t content_length;
 
+    int header_ready;
+    char *resp_header;
+    size_t resp_header_len;
+
+    int no_cache;
+
     
     pthread_mutex_t m;
     int is_dirty;
@@ -48,10 +54,10 @@ typedef struct CacheEntry {
     SubNode *subs; 
     int subs_count;
     
-    CacheEntry *lru_prev;
-    CacheEntry *lru_next;
+    struct CacheEntry *lru_prev;
+    struct CacheEntry *lru_next;
 
-    CacheEntry *hash_next;
+    struct CacheEntry *hash_next;
     size_t bytes_total;
     uint64_t access_time;         // для LRU
     

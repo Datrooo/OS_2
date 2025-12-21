@@ -166,6 +166,10 @@ static CacheEntry *cache_entry_create(const CacheKey *key) {
     entry->is_failed = 0;
     entry->http_status = 0;
     entry->content_type = NULL;
+    entry->header_ready = 0;
+    entry->resp_header = NULL;
+    entry->resp_header_len = 0;
+    entry->no_cache = 0;
     entry->chunks = NULL;
     entry->chunks_count = 0;
     entry->chunks_capacity = 0;
@@ -185,6 +189,7 @@ static void cache_entry_destroy(CacheEntry *entry) {
     
     if (entry->key.s) free(entry->key.s);
     if (entry->content_type) free(entry->content_type);
+    if (entry->resp_header) free(entry->resp_header);
     
     for (int i = 0; i < entry->chunks_count; i++) {
         if (entry->chunks[i] && entry->chunks[i]->data) {
@@ -312,6 +317,7 @@ void cache_entry_complete(CacheEntry *entry, int http_status, const char *conten
     pthread_mutex_lock(&entry->m);
     
     entry->http_status = http_status;
+    entry->no_cache = (http_status != 200);
     entry->is_completed = 1;
     
     if (content_type) {
@@ -376,8 +382,9 @@ int cache_entry_get_status(CacheEntry *entry) {
 const char *cache_entry_get_content_type(CacheEntry *entry) {
     if (!entry) return NULL;
     pthread_mutex_lock(&entry->m);
-    return entry->content_type;
+    const char *ct = entry->content_type;
     pthread_mutex_unlock(&entry->m);
+    return ct;
 }
 
 void cache_remove_entry(CacheEntry *entry) {

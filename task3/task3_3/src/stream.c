@@ -10,6 +10,8 @@
 #include "stream.h"
 #include "cache.h"
 
+#define STREAM_HEADER_BUF_SIZE 2048
+
 
 static void format_http_date(char *buf, size_t buf_len) {
     time_t now = time(NULL);
@@ -27,30 +29,52 @@ int stream_format_response_header(CacheEntry *entry,
     char date_buf[64];
     format_http_date(date_buf, sizeof(date_buf));
     
+    int http_status = 200;
+    const char *content_type = "application/octet-stream";
+    size_t produced = 0;
+    int is_completed = 0;
     size_t content_length = 0;
-    
-    if (entry->is_completed) {
-        content_length = entry->produced;
-    } else {
-        content_length = entry->content_length;
+
+    pthread_mutex_lock(&entry->m);
+    http_status = entry->http_status > 0 ? entry->http_status : 200;
+    content_type = (entry->content_type && entry->content_type[0]) ? entry->content_type : "application/octet-stream";
+    produced = entry->produced;
+    is_completed = entry->is_completed;
+    content_length = entry->content_length;
+    pthread_mutex_unlock(&entry->m);
+
+    if (is_completed) {
+        content_length = produced;
     }
     
-    int len = snprintf(buf, buf_len,
-        "HTTP/1.0 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "Date: %s\r\n"
-        "Server: CachingProxy/1.0\r\n"
-        "\r\n",
-        entry->http_status,
-        entry->http_status == 200 ? "OK" : 
-        entry->http_status == 404 ? "Not Found" :
-        entry->http_status == 500 ? "Internal Server Error" :
-        "Unknown",
-        strlen(entry->content_type) > 0 ? entry->content_type : "application/octet-stream",
-        content_length,
-        date_buf);
+    int len;
+    const char *reason =
+        http_status == 200 ? "OK" :
+        http_status == 404 ? "Not Found" :
+        http_status == 500 ? "Internal Server Error" :
+        "Unknown";
+
+    if (is_completed && content_length > 0) {
+        len = snprintf(buf, buf_len,
+            "HTTP/1.0 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n"
+            "Date: %s\r\n"
+            "Server: CachingProxy/1.0\r\n"
+            "\r\n",
+            http_status, reason, content_type, content_length, date_buf);
+    } else {
+        // Streaming: omit Content-Length (unknown until complete)
+        len = snprintf(buf, buf_len,
+            "HTTP/1.0 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Connection: close\r\n"
+            "Date: %s\r\n"
+            "Server: CachingProxy/1.0\r\n"
+            "\r\n",
+            http_status, reason, content_type, date_buf);
+    }
     
     if (len < 0 || len >= (int)buf_len) {
         fprintf(stderr, "[STREAM] Header formatting failed\n");
@@ -61,25 +85,55 @@ int stream_format_response_header(CacheEntry *entry,
     
     fprintf(stdout, "[STREAM] Formatted header (%zu bytes):\n", *out_len);
     fprintf(stdout, "[STREAM] Status: %d, Content-Type: %s, Length: %zu\n",
-            entry->http_status, entry->content_type, content_length);
+            http_status, content_type, content_length);
     
     return 0;
 }
 
 
 int stream_send_header(Session *session) {
-    if (!session || !session->entry || session->header_sent) {
+    if (!session || !session->entry) {
         return -1;
+    }
+    if (session->header_sent) {
+        return 0;
     }
     
     CacheEntry *entry = session->entry;
+
+    pthread_mutex_lock(&entry->m);
+    int header_ready = entry->header_ready;
+    size_t origin_hdr_len = entry->resp_header_len;
+    const char *origin_hdr = entry->resp_header;
+    pthread_mutex_unlock(&entry->m);
+
+    if (!header_ready) {
+        // Wait until downloader parses origin response header.
+        return 0;
+    }
     
     if (session->header_len == 0) {
-        if (stream_format_response_header(entry, 
-                                          session->header_buf, 
-                                          sizeof(session->header_buf),
-                                          &session->header_len) < 0) {
-            return -1;
+        if (origin_hdr && origin_hdr_len > 0) {
+            free(session->header_buf);
+            session->header_buf = (char *)malloc(origin_hdr_len);
+            if (!session->header_buf) {
+                return -1;
+            }
+            memcpy(session->header_buf, origin_hdr, origin_hdr_len);
+            session->header_len = origin_hdr_len;
+        } else {
+            if (!session->header_buf) {
+                session->header_buf = (char *)malloc(STREAM_HEADER_BUF_SIZE);
+                if (!session->header_buf) {
+                    return -1;
+                }
+            }
+            if (stream_format_response_header(entry,
+                                              session->header_buf,
+                                              STREAM_HEADER_BUF_SIZE,
+                                              &session->header_len) < 0) {
+                return -1;
+            }
         }
     }
     
@@ -121,12 +175,17 @@ int stream_send_body(Session *session) {
         return -1;
     }
     
-    if (result == 0) {
-        if (entry->is_completed) {
+    if (result == 1) {
+        // No data at current cursor
+        pthread_mutex_lock(&entry->m);
+        int completed = entry->is_completed;
+        size_t produced = entry->produced;
+        pthread_mutex_unlock(&entry->m);
+
+        if (completed && session->cursor >= produced) {
             return 1;
-        } else {
-            return 0;
         }
+        return 0;
     }
     
     if (size == 0) {
