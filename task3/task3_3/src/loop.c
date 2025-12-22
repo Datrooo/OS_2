@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -60,6 +61,8 @@ static struct ev_loop *g_loop = NULL;
 static int g_listen_fd = -1;
 static ev_io g_listen_watcher;
 static ev_async g_async_watcher;
+static ev_signal g_sigint_watcher;
+static ev_signal g_sigterm_watcher;
 
 static uint64_t g_session_counter = 0;
 
@@ -127,6 +130,13 @@ static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
         }
         node = node->next;
     }
+}
+
+static void signal_callback(struct ev_loop *loop, ev_signal *w, int revents) {
+    (void)w;
+    (void)revents;
+    fprintf(stderr, "\nSignal received, shutting down...\n");
+    ev_break(loop, EVBREAK_ALL);
 }
 
 static void client_write_callback(struct ev_loop *loop, ev_io *w, int revents);
@@ -416,6 +426,11 @@ int loop_init(const char *bind_ip, int listen_port) {
     
     ev_async_init(&g_async_watcher, async_callback);
     ev_async_start(g_loop, &g_async_watcher);
+
+    ev_signal_init(&g_sigint_watcher, signal_callback, SIGINT);
+    ev_signal_start(g_loop, &g_sigint_watcher);
+    ev_signal_init(&g_sigterm_watcher, signal_callback, SIGTERM);
+    ev_signal_start(g_loop, &g_sigterm_watcher);
     
     return 0;
 }
@@ -436,6 +451,8 @@ void loop_stop(void) {
 
 void loop_shutdown(void) {
     if (g_loop) {
+        ev_signal_stop(g_loop, &g_sigterm_watcher);
+        ev_signal_stop(g_loop, &g_sigint_watcher);
         ev_async_stop(g_loop, &g_async_watcher);
         ev_io_stop(g_loop, &g_listen_watcher);
         ev_break(g_loop, EVBREAK_ALL);
