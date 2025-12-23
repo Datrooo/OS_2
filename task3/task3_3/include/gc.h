@@ -5,6 +5,8 @@
 
 int gc_init(size_t max_cache_size);
 
+void gc_notify_pressure(void);
+
 void gc_shutdown(void);
 
 #endif

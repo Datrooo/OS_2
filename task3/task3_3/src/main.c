@@ -24,7 +24,7 @@
 #define VERSION "0.1"
 
 void print_usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s [port] [--bind <ipv4>]\n", argv0);
+    fprintf(stderr, "Usage: %s [port]\n", argv0);
 }
 
 void print_config(const char *bind_ip, int port) {
@@ -48,14 +48,6 @@ int main(int argc, char *argv[]) {
     int exit_code = 1;
     
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--bind") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 2;
-            }
-            bind_ip = argv[++i];
-            continue;
-        }
         if (argv[i][0] != '-') {
             port = atoi(argv[i]);
             continue;

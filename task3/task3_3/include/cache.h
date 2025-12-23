@@ -23,6 +23,11 @@ void cache_remove_entry(CacheEntry *entry);
 
 void cache_cleanup(void);
 
+
+int cache_trim_to_max(void);
+
+size_t cache_get_max_size(void);
+
 // otladka
 int cache_get_entry_count(void);
 size_t cache_get_total_size(void);

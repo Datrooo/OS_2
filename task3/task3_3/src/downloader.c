@@ -11,6 +11,8 @@
 #include <netdb.h>
 #include <errno.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <ev.h>
 
 #include "downloader.h"
 #include "cache.h"
@@ -20,6 +22,95 @@
 #define DOWNLOADER_QUEUE_SIZE 1024
 #define DOWNLOAD_BUFFER_SIZE 4096
 #define ORIGIN_HEADER_MAX 16384
+#define CONNECT_TIMEOUT_SEC 5.0
+
+typedef struct {
+    struct ev_loop *loop;
+    ev_io io;
+    ev_timer timer;
+    int fd;
+    int fired;
+    int timed_out;
+    int soerr;
+} ConnectWaitCtx;
+
+static void connect_wait_stop(ConnectWaitCtx *ctx) {
+    if (!ctx || !ctx->loop) return;
+    ev_io_stop(ctx->loop, &ctx->io);
+    ev_timer_stop(ctx->loop, &ctx->timer);
+}
+
+static void connect_wait_io_cb(EV_P_ ev_io *w, int revents) {
+    (void)revents;
+    ConnectWaitCtx *ctx = (ConnectWaitCtx *)w->data;
+    if (!ctx) {
+        ev_break(EV_A_ EVBREAK_ONE);
+        return;
+    }
+
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    if (getsockopt(ctx->fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0) {
+        ctx->soerr = errno;
+    } else {
+        ctx->soerr = soerr;
+    }
+
+    ctx->fired = 1;
+    ctx->timed_out = 0;
+    connect_wait_stop(ctx);
+    ev_break(EV_A_ EVBREAK_ONE);
+}
+
+static void connect_wait_timer_cb(EV_P_ ev_timer *w, int revents) {
+    (void)revents;
+    ConnectWaitCtx *ctx = (ConnectWaitCtx *)w->data;
+    if (!ctx) {
+        ev_break(EV_A_ EVBREAK_ONE);
+        return;
+    }
+    ctx->fired = 1;
+    ctx->timed_out = 1;
+    ctx->soerr = ETIMEDOUT;
+    connect_wait_stop(ctx);
+    ev_break(EV_A_ EVBREAK_ONE);
+}
+
+static int wait_connect_writable_libev(int fd, double timeout_sec, int *out_soerr) {
+    if (out_soerr) *out_soerr = 0;
+
+    struct ev_loop *loop = ev_loop_new(0);
+    if (!loop) {
+        return -1;
+    }
+
+    ConnectWaitCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.loop = loop;
+    ctx.fd = fd;
+    ctx.soerr = 0;
+
+    ev_io_init(&ctx.io, connect_wait_io_cb, fd, EV_WRITE);
+    ctx.io.data = &ctx;
+    ev_timer_init(&ctx.timer, connect_wait_timer_cb, timeout_sec, 0.0);
+    ctx.timer.data = &ctx;
+
+    ev_io_start(loop, &ctx.io);
+    ev_timer_start(loop, &ctx.timer);
+    ev_run(loop, 0);
+
+    ev_loop_destroy(loop);
+
+    if (!ctx.fired) {
+        return -1;
+    }
+
+    if (out_soerr) {
+        *out_soerr = ctx.soerr;
+    }
+
+    return ctx.timed_out ? 1 : 0;
+}
 
 static int find_header_end_len(const char *buf, size_t len, size_t *out_header_len) {
     if (!buf || len < 4) return 0;
@@ -120,13 +211,68 @@ static int origin_connect(const char *host, int port) {
 
     int fd = -1;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        char addr_str[INET6_ADDRSTRLEN] = {0};
+        void *addr_ptr = NULL;
+        if (ai->ai_family == AF_INET) {
+            addr_ptr = &((struct sockaddr_in *)ai->ai_addr)->sin_addr;
+        } else if (ai->ai_family == AF_INET6) {
+            addr_ptr = &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr;
+        }
+        if (addr_ptr) {
+            if (!inet_ntop(ai->ai_family, addr_ptr, addr_str, sizeof(addr_str))) {
+                snprintf(addr_str, sizeof(addr_str), "(inet_ntop failed)");
+            }
+            fprintf(stdout, "[DL] Trying %s (%s)\n", addr_str, (ai->ai_family == AF_INET6) ? "IPv6" : "IPv4");
+        }
+
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
             continue;
         }
 
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0) {
+            fprintf(stderr, "[DL] fcntl(F_GETFL) failed: %s\n", strerror(errno));
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            fprintf(stderr, "[DL] fcntl(F_SETFL,O_NONBLOCK) failed: %s\n", strerror(errno));
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        int rc_conn = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc_conn == 0) {
+            if (fcntl(fd, F_SETFL, flags) != 0) {
+                fprintf(stderr, "[DL] fcntl(restore blocking) failed: %s\n", strerror(errno));
+                close(fd);
+                fd = -1;
+                continue;
+            }
             break;
+        }
+
+        if (rc_conn < 0 && errno == EINPROGRESS) {
+            int soerr = 0;
+            int wrc = wait_connect_writable_libev(fd, CONNECT_TIMEOUT_SEC, &soerr);
+            if (wrc < 0) {
+                fprintf(stderr, "[DL] libev connect-wait failed\n");
+            } else if (wrc > 0) {
+                fprintf(stderr, "[DL] connect timeout\n");
+            } else if (soerr == 0) {
+                if (fcntl(fd, F_SETFL, flags) != 0) {
+                    fprintf(stderr, "[DL] fcntl(restore blocking) failed: %s\n", strerror(errno));
+                    close(fd);
+                    fd = -1;
+                    continue;
+                }
+                break; // success
+            } else {
+                fprintf(stderr, "[DL] connect failed (SO_ERROR=%d: %s)\n", soerr, strerror(soerr));
+            }
         }
 
         close(fd);
@@ -159,10 +305,21 @@ static int origin_send_request(int fd, const char *target, const char *host) {
     
     fprintf(stdout, "[DL] Sending request (%d bytes)\n", len);
     
-    ssize_t sent = send(fd, request, len, MSG_NOSIGNAL);
-    if (sent < 0) {
-        fprintf(stderr, "[DL] Send failed: %s\n", strerror(errno));
-        return -1;
+    size_t off = 0;
+    while (off < (size_t)len) {
+        ssize_t sent = send(fd, request + off, (size_t)len - off, MSG_NOSIGNAL);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fprintf(stderr, "[DL] Send failed: %s\n", strerror(errno));
+            return -1;
+        }
+        if (sent == 0) {
+            fprintf(stderr, "[DL] Send returned 0\n");
+            return -1;
+        }
+        off += (size_t)sent;
     }
     
     return 0;
@@ -294,6 +451,9 @@ static void *downloader_worker(void *arg) {
             ssize_t n = recv(origin_fd, buffer, sizeof(buffer), 0);
             
             if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
                 fprintf(stderr, "[DL] Worker %d: Recv error: %s\n", thread_id, strerror(errno));
                 break;
             }
@@ -356,18 +516,44 @@ static void *downloader_worker(void *arg) {
 
                 size_t spill = header_buf_len - header_len;
                 if (spill > 0) {
-                    cache_append_chunk(entry, (const uint8_t *)(header_buf + header_len), spill);
+                    int rc = cache_append_chunk(entry, (const uint8_t *)(header_buf + header_len), spill);
+                    if (rc == -2) {
+                        fprintf(stderr, "[DL] Entry %lu exceeds cache capacity; aborting\n", entry->id);
+                        cache_entry_failed(entry);
+                        break;
+                    } else if (rc != 0) {
+                        fprintf(stderr, "[DL] Failed to append spill chunk\n");
+                        cache_entry_failed(entry);
+                        break;
+                    }
                 }
 
                 if ((size_t)n > can_copy) {
                     size_t rem = (size_t)n - can_copy;
-                    cache_append_chunk(entry, buffer + can_copy, rem);
+                    int rc = cache_append_chunk(entry, buffer + can_copy, rem);
+                    if (rc == -2) {
+                        fprintf(stderr, "[DL] Entry %lu exceeds cache capacity; aborting\n", entry->id);
+                        cache_entry_failed(entry);
+                        break;
+                    } else if (rc != 0) {
+                        fprintf(stderr, "[DL] Failed to append data chunk\n");
+                        cache_entry_failed(entry);
+                        break;
+                    }
                 }
             } else {
-                cache_append_chunk(entry, buffer, n);
+                int rc = cache_append_chunk(entry, buffer, n);
+                if (rc == -2) {
+                    fprintf(stderr, "[DL] Entry %lu exceeds cache capacity; aborting\n", entry->id);
+                    cache_entry_failed(entry);
+                    break;
+                } else if (rc != 0) {
+                    fprintf(stderr, "[DL] Failed to append data chunk\n");
+                    cache_entry_failed(entry);
+                    break;
+                }
             }
             
-            //Enqueue dirty (batch processing)
             pthread_mutex_lock(&entry->m);
             entry->is_dirty = 1;
             pthread_mutex_unlock(&entry->m);
@@ -406,8 +592,15 @@ int downloader_init(void) {
         return 0;
     }
     
-    pthread_mutex_init(&g_task_queue.m, NULL);
-    pthread_cond_init(&g_task_queue.cond, NULL);
+    if (pthread_mutex_init(&g_task_queue.m, NULL) != 0) {
+        fprintf(stderr, "[DL] pthread_mutex_init failed\n");
+        return -1;
+    }
+    if (pthread_cond_init(&g_task_queue.cond, NULL) != 0) {
+        fprintf(stderr, "[DL] pthread_cond_init failed\n");
+        pthread_mutex_destroy(&g_task_queue.m);
+        return -1;
+    }
     
     g_task_queue.shutdown_flag = 0;
     

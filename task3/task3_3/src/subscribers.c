@@ -2,9 +2,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <errno.h>
 #include "subscribers.h"
 
 #include "types.h"
+
+static int subs_mutex_lock(pthread_mutex_t *m, const char *ctx) {
+    int rc = pthread_mutex_lock(m);
+    if (rc != 0) {
+        fprintf(stderr, "[SUBS] %s: pthread_mutex_lock failed: %s\n", ctx, strerror(rc));
+        return -1;
+    }
+    return 0;
+}
+
+static int subs_mutex_unlock(pthread_mutex_t *m, const char *ctx) {
+    int rc = pthread_mutex_unlock(m);
+    if (rc != 0) {
+        fprintf(stderr, "[SUBS] %s: pthread_mutex_unlock failed: %s\n", ctx, strerror(rc));
+        return -1;
+    }
+    return 0;
+}
 
 
 int subscriber_add(CacheEntry *entry, Session *session) {
@@ -12,12 +31,14 @@ int subscriber_add(CacheEntry *entry, Session *session) {
         return -1;
     }
     
-    pthread_mutex_lock(&entry->m);
+    if (subs_mutex_lock(&entry->m, "add") != 0) {
+        return -1;
+    }
     
     SubNode *existing = entry->subs;
     while (existing) {
         if (existing->s == session) {
-            pthread_mutex_unlock(&entry->m);
+            (void)subs_mutex_unlock(&entry->m, "add(already)");
             fprintf(stdout, "[SUBS] Session %llu already subscribed\n",
                     (unsigned long long)session->id);
             return 0;
@@ -27,7 +48,7 @@ int subscriber_add(CacheEntry *entry, Session *session) {
     
     SubNode *new_sub = malloc(sizeof(SubNode));
     if (!new_sub) {
-        pthread_mutex_unlock(&entry->m);
+        (void)subs_mutex_unlock(&entry->m, "add(alloc_fail)");
         fprintf(stderr, "[SUBS] Failed to allocate SubNode\n");
         return -1;
     }
@@ -40,7 +61,7 @@ int subscriber_add(CacheEntry *entry, Session *session) {
     fprintf(stdout, "[SUBS] Added subscriber (session %llu), total: %d\n",
             (unsigned long long)session->id, entry->subs_count);
     
-    pthread_mutex_unlock(&entry->m);
+    (void)subs_mutex_unlock(&entry->m, "add(done)");
     
     return 0;
 }
@@ -51,7 +72,9 @@ int subscriber_remove(CacheEntry *entry, Session *session) {
         return -1;
     }
     
-    pthread_mutex_lock(&entry->m);
+    if (subs_mutex_lock(&entry->m, "remove") != 0) {
+        return -1;
+    }
     
     SubNode *current = entry->subs;
     SubNode *prev = NULL;
@@ -70,7 +93,7 @@ int subscriber_remove(CacheEntry *entry, Session *session) {
             fprintf(stdout, "[SUBS] Removed subscriber (session %llu), total: %d\n",
                     (unsigned long long)session->id, entry->subs_count);
             
-            pthread_mutex_unlock(&entry->m);
+                (void)subs_mutex_unlock(&entry->m, "remove(done)");
             return 0;
         }
         
@@ -81,7 +104,7 @@ int subscriber_remove(CacheEntry *entry, Session *session) {
     fprintf(stderr, "[SUBS] Session %llu not found in subscribers\n",
             (unsigned long long)session->id);
     
-    pthread_mutex_unlock(&entry->m);
+    (void)subs_mutex_unlock(&entry->m, "remove(not_found)");
     return -1;
 }
 
@@ -91,18 +114,20 @@ Session **subscriber_get_all(CacheEntry *entry, int *out_count) {
         return NULL;
     }
     
-    pthread_mutex_lock(&entry->m);
+    if (subs_mutex_lock(&entry->m, "get_all") != 0) {
+        return NULL;
+    }
     
     int count = entry->subs_count;
     if (count == 0) {
-        pthread_mutex_unlock(&entry->m);
+        (void)subs_mutex_unlock(&entry->m, "get_all(empty)");
         *out_count = 0;
         return NULL;
     }
     
     Session **sessions = malloc((count + 1) * sizeof(Session *));
     if (!sessions) {
-        pthread_mutex_unlock(&entry->m);
+        (void)subs_mutex_unlock(&entry->m, "get_all(alloc_fail)");
         return NULL;
     }
     
@@ -119,7 +144,7 @@ Session **subscriber_get_all(CacheEntry *entry, int *out_count) {
     
     fprintf(stdout, "[SUBS] Retrieved %d subscribers for entry\n", count);
     
-    pthread_mutex_unlock(&entry->m);
+    (void)subs_mutex_unlock(&entry->m, "get_all(done)");
     
     return sessions;
 }
@@ -130,7 +155,9 @@ int subscriber_clear_all(CacheEntry *entry) {
         return -1;
     }
     
-    pthread_mutex_lock(&entry->m);
+    if (subs_mutex_lock(&entry->m, "clear_all") != 0) {
+        return -1;
+    }
     
     SubNode *current = entry->subs;
     while (current) {
@@ -144,7 +171,7 @@ int subscriber_clear_all(CacheEntry *entry) {
     
     fprintf(stdout, "[SUBS] Cleared all subscribers\n");
     
-    pthread_mutex_unlock(&entry->m);
+    (void)subs_mutex_unlock(&entry->m, "clear_all(done)");
     
     return 0;
 }
@@ -154,9 +181,11 @@ int is_entry_downloading(CacheEntry *entry) {
         return 0;
     }
     
-    pthread_mutex_lock(&entry->m);
+    if (subs_mutex_lock(&entry->m, "is_downloading") != 0) {
+        return 0;
+    }
     int downloading = entry->is_downloader_running;
-    pthread_mutex_unlock(&entry->m);
+    (void)subs_mutex_unlock(&entry->m, "is_downloading(done)");
     
     return downloading;
 }

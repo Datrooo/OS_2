@@ -57,6 +57,19 @@ static char *normalize_target_origin_form(const char *target) {
     return xstrdup(path);
 }
 
+static int set_nonblocking(int fd, const char *tag) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        fprintf(stderr, "[%s] fcntl(F_GETFL) failed: %s\n", tag, strerror(errno));
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        fprintf(stderr, "[%s] fcntl(F_SETFL,O_NONBLOCK) failed: %s\n", tag, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 static struct ev_loop *g_loop = NULL;
 static int g_listen_fd = -1;
 static ev_io g_listen_watcher;
@@ -180,14 +193,6 @@ static void client_read_callback(struct ev_loop *loop, ev_io *w, int revents) {
     
     s->req_len += n;
     
-    const char *header_end = strstr(s->reqbuf, "\r\n\r\n");
-    if (!header_end) {
-        // не все данные получили
-        return;
-    }
-    
-    size_t headers_len = (header_end - s->reqbuf) + 4;
-    
     char *method = NULL;
     char *target = NULL;
     char *http_version = NULL;
@@ -196,8 +201,12 @@ static void client_read_callback(struct ev_loop *loop, ev_io *w, int revents) {
     int parse_result = parse_http_request(s->reqbuf, s->req_len,
                                           &method, &target, &http_version,
                                           &headers_end);
-    
-    if (parse_result <= 0) {
+
+    if (parse_result == 0) {
+        // need more data
+        return;
+    }
+    if (parse_result < 0) {
         fprintf(stderr, "[Session %lu] Failed to parse HTTP request\n", s->id);
         s->state = SESSION_ERROR;
         ev_io_stop(loop, &s->read_w);
@@ -217,14 +226,17 @@ static void client_read_callback(struct ev_loop *loop, ev_io *w, int revents) {
             "HTTP/1.0 501 Not Implemented\r\n"
             "Connection: close\r\n"
             "\r\n";
-        (void)send(fd, resp, sizeof(resp) - 1, MSG_NOSIGNAL);
+        ssize_t wr = send(fd, resp, sizeof(resp) - 1, MSG_NOSIGNAL);
+        if (wr < 0 && errno != EPIPE && errno != ECONNRESET) {
+            fprintf(stderr, "[Session %lu] send(501) failed: %s\n", s->id, strerror(errno));
+        }
         fprintf(stderr, "[Session %lu] Unsupported method: %s\n", s->id, s->method ? s->method : "(null)");
         s->state = SESSION_ERROR;
         ev_io_stop(loop, &s->read_w);
         return;
     }
     
-    s->host = parse_host_header(s->reqbuf, headers_len);
+    s->host = parse_host_header(s->reqbuf, headers_end);
     if (!s->host) {
         fprintf(stderr, "[Session %lu] No Host header found\n", s->id);
         s->state = SESSION_ERROR;
@@ -386,12 +398,18 @@ static void accept_callback(struct ev_loop *loop, ev_io *w, int revents) {
     s->id = ++g_session_counter;
     
     char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+    if (!inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip))) {
+        snprintf(client_ip, sizeof(client_ip), "?");
+    }
     fprintf(stdout, "[Session %lu] New connection from %s:%d\n", 
             s->id, client_ip, ntohs(client_addr.sin_port));
-    
-    int flags = fcntl(client_fd, F_GETFL, 0);
-    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+    if (set_nonblocking(client_fd, "ACCEPT") != 0) {
+        close(client_fd);
+        s->fd = -1;
+        session_free(s);
+        return;
+    }
     
     ev_io_init(&s->read_w, client_read_callback, client_fd, EV_READ);
     s->read_w.data = (void *)s;
@@ -409,9 +427,12 @@ int loop_init(const char *bind_ip, int listen_port) {
     }
     
     fprintf(stdout, "Listen socket created: fd=%d, port=%d\n", g_listen_fd, listen_port);
-    
-    int flags = fcntl(g_listen_fd, F_GETFL, 0);
-    fcntl(g_listen_fd, F_SETFL, flags | O_NONBLOCK);
+
+    if (set_nonblocking(g_listen_fd, "LISTEN") != 0) {
+        close(g_listen_fd);
+        g_listen_fd = -1;
+        return -1;
+    }
     
     g_loop = ev_loop_new(0);
     if (!g_loop) {

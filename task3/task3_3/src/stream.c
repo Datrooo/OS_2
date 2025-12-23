@@ -121,6 +121,7 @@ int stream_send_header(Session *session) {
             }
             memcpy(session->header_buf, origin_hdr, origin_hdr_len);
             session->header_len = origin_hdr_len;
+            session->header_sent_bytes = 0;
         } else {
             if (!session->header_buf) {
                 session->header_buf = (char *)malloc(STREAM_HEADER_BUF_SIZE);
@@ -134,10 +135,18 @@ int stream_send_header(Session *session) {
                                               &session->header_len) < 0) {
                 return -1;
             }
+            session->header_sent_bytes = 0;
         }
     }
-    
-    ssize_t sent = send(session->fd, session->header_buf, session->header_len, MSG_NOSIGNAL);
+
+    if (session->header_sent_bytes >= session->header_len) {
+        session->header_sent = 1;
+        return 0;
+    }
+
+    const char *p = session->header_buf + session->header_sent_bytes;
+    size_t remaining = session->header_len - session->header_sent_bytes;
+    ssize_t sent = send(session->fd, p, remaining, MSG_NOSIGNAL);
     
     if (sent < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -148,9 +157,15 @@ int stream_send_header(Session *session) {
         return -1;
     }
     
-    if (sent > 0) {
-        fprintf(stdout, "[Session %lu] Sent response header (%zd bytes)\n", 
-                session->id, sent);
+    if (sent == 0) {
+        return 0;
+    }
+
+    session->header_sent_bytes += (size_t)sent;
+    fprintf(stdout, "[Session %lu] Sent response header (%zu/%zu bytes)\n",
+            session->id, session->header_sent_bytes, session->header_len);
+
+    if (session->header_sent_bytes >= session->header_len) {
         session->header_sent = 1;
     }
     

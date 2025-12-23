@@ -7,6 +7,7 @@
 
 #include "session.h"
 #include "cache.h"
+#include "subscribers.h"
 
 #define SESSION_HEADER_BUF_SIZE 2048
 
@@ -33,6 +34,7 @@ Session *session_new(int fd) {
 
     s->header_sent = 0;
     s->header_len = 0;
+    s->header_sent_bytes = 0;
     s->header_buf = (char *)malloc(SESSION_HEADER_BUF_SIZE);
     if (s->header_buf) {
         memset(s->header_buf, 0, SESSION_HEADER_BUF_SIZE);
@@ -71,18 +73,12 @@ int session_attach_entry(Session *s, CacheEntry *entry) {
     
     s->entry = entry;
     s->cursor = 0;
-    
-    SubNode *sub = (SubNode *)malloc(sizeof(SubNode));
-    if (!sub) return -1;
-    
-    sub->s = s;
-    sub->hh_next = entry->subs;
-    entry->subs = sub;
-    entry->subs_count++;
-    
-    fprintf(stdout, "[Session %lu] Attached to cache entry (ID: %lu, subscribers: %d)\n",
-            s->id, entry->id, entry->subs_count);
-    
+
+    if (subscriber_add(entry, s) != 0) {
+        s->entry = NULL;
+        s->cursor = 0;
+        return -1;
+    }
     return 0;
 }
 
@@ -90,22 +86,11 @@ void session_detach_entry(Session *s) {
     if (!s || !s->entry) return;
     
     CacheEntry *entry = s->entry;
-    
-    SubNode **node = &entry->subs;
-    while (*node) {
-        if ((*node)->s == s) {
-            SubNode *tmp = *node;
-            *node = (*node)->hh_next;
-            free(tmp);
-            entry->subs_count--;
-            
-            fprintf(stdout, "[Session %lu] Detached from cache entry (ID: %lu, remaining: %d)\n",
-                    s->id, entry->id, entry->subs_count);
-            break;
-        }
-        node = &((*node)->hh_next);
+
+    if (subscriber_remove(entry, s) != 0) {
+        fprintf(stderr, "[Session %lu] subscriber_remove failed\n", s->id);
     }
-    
+
     s->entry = NULL;
     s->cursor = 0;
 

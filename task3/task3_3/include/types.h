@@ -95,6 +95,7 @@ typedef struct Session {
     int header_sent;
     char *header_buf;
     size_t header_len;
+    size_t header_sent_bytes;
     
     uint64_t id;
 } Session;
