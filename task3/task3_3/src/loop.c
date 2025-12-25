@@ -57,19 +57,6 @@ static char *normalize_target_origin_form(const char *target) {
     return xstrdup(path);
 }
 
-static int set_nonblocking(int fd, const char *tag) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) {
-        fprintf(stderr, "[%s] fcntl(F_GETFL) failed: %s\n", tag, strerror(errno));
-        return -1;
-    }
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        fprintf(stderr, "[%s] fcntl(F_SETFL,O_NONBLOCK) failed: %s\n", tag, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
 static struct ev_loop *g_loop = NULL;
 static int g_listen_fd = -1;
 static ev_io g_listen_watcher;
@@ -404,7 +391,7 @@ static void accept_callback(struct ev_loop *loop, ev_io *w, int revents) {
     fprintf(stdout, "[Session %lu] New connection from %s:%d\n", 
             s->id, client_ip, ntohs(client_addr.sin_port));
 
-    if (set_nonblocking(client_fd, "ACCEPT") != 0) {
+    if (net_set_nonblocking(client_fd, "ACCEPT") != 0) {
         close(client_fd);
         s->fd = -1;
         session_free(s);
@@ -428,7 +415,7 @@ int loop_init(const char *bind_ip, int listen_port) {
     
     fprintf(stdout, "Listen socket created: fd=%d, port=%d\n", g_listen_fd, listen_port);
 
-    if (set_nonblocking(g_listen_fd, "LISTEN") != 0) {
+    if (net_set_nonblocking(g_listen_fd, "LISTEN") != 0) {
         close(g_listen_fd);
         g_listen_fd = -1;
         return -1;

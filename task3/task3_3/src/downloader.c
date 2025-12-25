@@ -17,6 +17,7 @@
 #include "downloader.h"
 #include "cache.h"
 #include "dirty.h"
+#include "net.h"
 
 #define DOWNLOADER_THREAD_COUNT 4
 #define DOWNLOADER_QUEUE_SIZE 1024
@@ -237,8 +238,7 @@ static int origin_connect(const char *host, int port) {
             fd = -1;
             continue;
         }
-        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-            fprintf(stderr, "[DL] fcntl(F_SETFL,O_NONBLOCK) failed: %s\n", strerror(errno));
+        if (net_set_nonblocking(fd, "DL") != 0) {
             close(fd);
             fd = -1;
             continue;
