@@ -12,10 +12,8 @@
 #define SESSION_HEADER_BUF_SIZE 2048
 
 Session *session_new(int fd) {
-    Session *s = (Session *)malloc(sizeof(Session));
+    Session *s = calloc(1, sizeof(Session));
     if (!s) return NULL;
-    
-    memset(s, 0, sizeof(Session));
     
     s->fd = fd;
     s->state = SESSION_REQ_RECV;
@@ -36,8 +34,10 @@ Session *session_new(int fd) {
     s->header_len = 0;
     s->header_sent_bytes = 0;
     s->header_buf = (char *)malloc(SESSION_HEADER_BUF_SIZE);
-    if (s->header_buf) {
-        memset(s->header_buf, 0, SESSION_HEADER_BUF_SIZE);
+    s->header_buf = calloc(1, SESSION_HEADER_BUF_SIZE);
+    if (!s->header_buf) {
+        free(s);
+        return NULL;
     }
     
     return s;

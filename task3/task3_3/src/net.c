@@ -46,7 +46,7 @@ int net_listen_on(const char *bind_ip, int port) {
         return -1;
     }
     
-    if (listen(fd, 1024) == -1) {
+    if (listen(fd, 10) == -1) {
         fprintf(stderr, "[NET] Listen failed: %s\n", strerror(errno));
         close(fd);
         return -1;

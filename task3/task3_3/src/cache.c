@@ -200,11 +200,9 @@ static CacheEntry *find_delete_candidate_locked(void) {
 
 static CacheEntry *cache_entry_create(const CacheKey *key) {
     if (!key || !key->s) return NULL;
-    
-    CacheEntry *entry = (CacheEntry *)malloc(sizeof(CacheEntry));
+
+    CacheEntry * entry = calloc(1, sizeof(CacheEntry));
     if (!entry) return NULL;
-    
-    memset(entry, 0, sizeof(CacheEntry));
     
     entry->key.s = (char *)malloc(key->len + 1);
     if (!entry->key.s) {
