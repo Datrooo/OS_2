@@ -16,13 +16,19 @@ typedef struct DirtyQueue{
     pthread_mutex_t m;
 } DirtyQueue;
 
-static DirtyQueue g_dirty_queue = {
-    .entries = NULL,
-    .count = 0,
-    .capacity = 0
-};
+typedef struct DirtyState {
+    DirtyQueue q;
+    int initialized;
+} DirtyState;
 
-static int g_dirty_initialized = 0;
+static DirtyState g_dirty = {
+    .q = {
+        .entries = NULL,
+        .count = 0,
+        .capacity = 0,
+    },
+    .initialized = 0,
+};
 
 static int dirty_mutex_lock(pthread_mutex_t *m, const char *ctx) {
     int rc = pthread_mutex_lock(m);
@@ -42,29 +48,29 @@ static int dirty_mutex_unlock(pthread_mutex_t *m, const char *ctx) {
     return 0;
 }
 
-int dirty_init(void) {
-    if (g_dirty_initialized) {
+int dirty_create(void) {
+    if (g_dirty.initialized) {
         return 0;
     }
     
-    g_dirty_queue.capacity = DIRTY_QUEUE_MAX;
-    g_dirty_queue.entries = (CacheEntry **)malloc(DIRTY_QUEUE_MAX * sizeof(CacheEntry *));
-    if (!g_dirty_queue.entries) {
+    g_dirty.q.capacity = DIRTY_QUEUE_MAX;
+    g_dirty.q.entries = (CacheEntry **)malloc(DIRTY_QUEUE_MAX * sizeof(CacheEntry *));
+    if (!g_dirty.q.entries) {
         fprintf(stderr, "[DIRTY] Failed to allocate queue\n");
         return -1;
     }
     
-    g_dirty_queue.count = 0;
-    int rc = pthread_mutex_init(&g_dirty_queue.m, NULL);
+    g_dirty.q.count = 0;
+    int rc = pthread_mutex_init(&g_dirty.q.m, NULL);
     if (rc != 0) {
         fprintf(stderr, "[DIRTY] pthread_mutex_init failed: %s\n", strerror(rc));
-        free(g_dirty_queue.entries);
-        g_dirty_queue.entries = NULL;
-        g_dirty_queue.capacity = 0;
+        free(g_dirty.q.entries);
+        g_dirty.q.entries = NULL;
+        g_dirty.q.capacity = 0;
         return -1;
     }
     
-    g_dirty_initialized = 1;
+    g_dirty.initialized = 1;
     
     fprintf(stdout, "[DIRTY] Dirty queue initialized (capacity: %d)\n", DIRTY_QUEUE_MAX);
     
@@ -76,34 +82,34 @@ int dirty_enqueue(CacheEntry *entry) {
         return -1;
     }
 
-    if (!g_dirty_initialized) {
-        fprintf(stderr, "[DIRTY] dirty_enqueue() called before dirty_init()\n");
+    if (!g_dirty.initialized) {
+        fprintf(stderr, "[DIRTY] dirty_enqueue() called before dirty_create()\n");
         return -1;
     }
     
-    if (dirty_mutex_lock(&g_dirty_queue.m, "enqueue") != 0) {
+    if (dirty_mutex_lock(&g_dirty.q.m, "enqueue") != 0) {
         return -1;
     }
     
-    for (int i = 0; i < g_dirty_queue.count; i++) {
-        if (g_dirty_queue.entries[i] == entry) {
-            (void)dirty_mutex_unlock(&g_dirty_queue.m, "enqueue(already)");
+    for (int i = 0; i < g_dirty.q.count; i++) {
+        if (g_dirty.q.entries[i] == entry) {
+            (void)dirty_mutex_unlock(&g_dirty.q.m, "enqueue(already)");
             loop_notify_dirty();
             return 0;
         }
     }
     
-    if (g_dirty_queue.count >= g_dirty_queue.capacity) {
-        fprintf(stderr, "[DIRTY] Queue full (size: %d)\n", g_dirty_queue.count);
-        (void)dirty_mutex_unlock(&g_dirty_queue.m, "enqueue(full)");
+    if (g_dirty.q.count >= g_dirty.q.capacity) {
+        fprintf(stderr, "[DIRTY] Queue full (size: %d)\n", g_dirty.q.count);
+        (void)dirty_mutex_unlock(&g_dirty.q.m, "enqueue(full)");
         
         loop_notify_dirty();
         return -1;
     }
     
-    g_dirty_queue.entries[g_dirty_queue.count++] = entry;
+    g_dirty.q.entries[g_dirty.q.count++] = entry;
     
-    (void)dirty_mutex_unlock(&g_dirty_queue.m, "enqueue(done)");
+    (void)dirty_mutex_unlock(&g_dirty.q.m, "enqueue(done)");
 
     loop_notify_dirty();
     
@@ -111,14 +117,14 @@ int dirty_enqueue(CacheEntry *entry) {
 }
 
 int dirty_process_all(void) {
-    if (dirty_mutex_lock(&g_dirty_queue.m, "process_all") != 0) {
+    if (dirty_mutex_lock(&g_dirty.q.m, "process_all") != 0) {
         return -1;
     }
     
-    int count = g_dirty_queue.count;
+    int count = g_dirty.q.count;
     
     if (count == 0) {
-        (void)dirty_mutex_unlock(&g_dirty_queue.m, "process_all(empty)");
+        (void)dirty_mutex_unlock(&g_dirty.q.m, "process_all(empty)");
         return 0;
     }
     
@@ -126,14 +132,14 @@ int dirty_process_all(void) {
     
     CacheEntry **to_process = (CacheEntry **)malloc(count * sizeof(CacheEntry *));
     if (!to_process) {
-        (void)dirty_mutex_unlock(&g_dirty_queue.m, "process_all(alloc_fail)");
+        (void)dirty_mutex_unlock(&g_dirty.q.m, "process_all(alloc_fail)");
         return -1;
     }
     
-    memcpy(to_process, g_dirty_queue.entries, count * sizeof(CacheEntry *));
-    g_dirty_queue.count = 0;
+    memcpy(to_process, g_dirty.q.entries, count * sizeof(CacheEntry *));
+    g_dirty.q.count = 0;
     
-    (void)dirty_mutex_unlock(&g_dirty_queue.m, "process_all(copy_done)");
+    (void)dirty_mutex_unlock(&g_dirty.q.m, "process_all(copy_done)");
     
     for (int i = 0; i < count; i++) {
         CacheEntry *entry = to_process[i];
@@ -164,40 +170,40 @@ int dirty_process_all(void) {
 }
 
 int dirty_get_queue_size(void) {
-    if (dirty_mutex_lock(&g_dirty_queue.m, "get_queue_size") != 0) {
+    if (dirty_mutex_lock(&g_dirty.q.m, "get_queue_size") != 0) {
         return -1;
     }
-    int size = g_dirty_queue.count;
-    (void)dirty_mutex_unlock(&g_dirty_queue.m, "get_queue_size(done)");
+    int size = g_dirty.q.count;
+    (void)dirty_mutex_unlock(&g_dirty.q.m, "get_queue_size(done)");
     return size;
 }
 
-void dirty_cleanup(void) {
-    if (!g_dirty_initialized) {
+void dirty_destroy(void) {
+    if (!g_dirty.initialized) {
         return;
     }
     
     fprintf(stdout, "[DIRTY] Cleaning up dirty queue\n");
     
-    if (dirty_mutex_lock(&g_dirty_queue.m, "cleanup") != 0) {
+    if (dirty_mutex_lock(&g_dirty.q.m, "cleanup") != 0) {
         return;
     }
     
-    if (g_dirty_queue.entries) {
-        free(g_dirty_queue.entries);
-        g_dirty_queue.entries = NULL;
+    if (g_dirty.q.entries) {
+        free(g_dirty.q.entries);
+        g_dirty.q.entries = NULL;
     }
     
-    g_dirty_queue.count = 0;
-    g_dirty_queue.capacity = 0;
+    g_dirty.q.count = 0;
+    g_dirty.q.capacity = 0;
     
-    (void)dirty_mutex_unlock(&g_dirty_queue.m, "cleanup(unlock)");
-    int drc = pthread_mutex_destroy(&g_dirty_queue.m);
+    (void)dirty_mutex_unlock(&g_dirty.q.m, "cleanup(unlock)");
+    int drc = pthread_mutex_destroy(&g_dirty.q.m);
     if (drc != 0) {
         fprintf(stderr, "[DIRTY] pthread_mutex_destroy failed: %s\n", strerror(drc));
     }
     
-    g_dirty_initialized = 0;
+    g_dirty.initialized = 0;
     
     fprintf(stdout, "[DIRTY] Dirty queue cleaned up\n");
 }

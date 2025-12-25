@@ -15,15 +15,27 @@ typedef struct CacheMap {
     int count;
 } CacheMap;
 
-static CacheMap g_cache_map = {NULL, 0, 0};
-static CacheEntry *g_lru_head = NULL;
-static CacheEntry *g_lru_tail = NULL;
-static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_cache_space_cond = PTHREAD_COND_INITIALIZER;
-static size_t g_cache_max_size = 0;
-static size_t g_cache_current_size = 0;
+typedef struct CacheState {
+    CacheMap map;
+    CacheEntry *lru_head;
+    CacheEntry *lru_tail;
+    pthread_mutex_t mutex;
+    pthread_cond_t space_cond;
+    size_t max_size;
+    size_t current_size;
+    uint64_t entry_id_counter;
+} CacheState;
 
-static uint64_t g_entry_id_counter = 0;
+static CacheState g_cache = {
+    .map = {NULL, 0, 0},
+    .lru_head = NULL,
+    .lru_tail = NULL,
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .space_cond = PTHREAD_COND_INITIALIZER,
+    .max_size = 0,
+    .current_size = 0,
+    .entry_id_counter = 0,
+};
 
 static void cache_log_pthread_rc(const char *ctx, const char *op, int rc) {
     if (rc == 0) return;
@@ -57,14 +69,14 @@ static unsigned int hash_djb2(const char *str, size_t len) {
 }
 
 static CacheEntry *cache_map_find(const CacheKey *key) {
-    if (!g_cache_map.entries || g_cache_map.count == 0) {
+    if (!g_cache.map.entries || g_cache.map.count == 0) {
         return NULL;
     }
     
     unsigned int h = hash_djb2(key->s, key->len);
-    int idx = h % g_cache_map.capacity;
+    int idx = h % g_cache.map.capacity;
     
-    CacheEntry *entry = g_cache_map.entries[idx];
+    CacheEntry *entry = g_cache.map.entries[idx];
     while (entry) {
         if (entry->key.len == key->len && 
             strcmp(entry->key.s, key->s) == 0) {
@@ -79,14 +91,14 @@ static CacheEntry *cache_map_find(const CacheKey *key) {
 static int cache_map_insert(CacheEntry *entry) {
     if (!entry || !entry->key.s) return -1;
     
-    if (g_cache_map.count >= g_cache_map.capacity * 0.75) {
-        int new_capacity = g_cache_map.capacity > 0 ? 
-                          g_cache_map.capacity * 2 : 32;
+    if (g_cache.map.count >= g_cache.map.capacity * 0.75) {
+        int new_capacity = g_cache.map.capacity > 0 ?
+                          g_cache.map.capacity * 2 : 32;
         CacheEntry **new_entries = (CacheEntry **)calloc(new_capacity, sizeof(CacheEntry *));
         if (!new_entries) return -1;
         
-        for (int i = 0; i < g_cache_map.capacity; i++) {
-            CacheEntry *e = g_cache_map.entries[i];
+        for (int i = 0; i < g_cache.map.capacity; i++) {
+            CacheEntry *e = g_cache.map.entries[i];
             while (e) {
                 unsigned int h = hash_djb2(e->key.s, e->key.len);
                 int new_idx = h % new_capacity;
@@ -97,32 +109,32 @@ static int cache_map_insert(CacheEntry *entry) {
             }
         }
         
-        free(g_cache_map.entries);
-        g_cache_map.entries = new_entries;
-        g_cache_map.capacity = new_capacity;
+        free(g_cache.map.entries);
+        g_cache.map.entries = new_entries;
+        g_cache.map.capacity = new_capacity;
     }
     
     unsigned int h = hash_djb2(entry->key.s, entry->key.len);
-    int idx = h % g_cache_map.capacity;
+    int idx = h % g_cache.map.capacity;
     
-    entry->hash_next = g_cache_map.entries[idx];
-    g_cache_map.entries[idx] = entry;
-    g_cache_map.count++;
+    entry->hash_next = g_cache.map.entries[idx];
+    g_cache.map.entries[idx] = entry;
+    g_cache.map.count++;
     
     return 0;
 }
 
 static void cache_map_remove(CacheEntry *entry) {
-    if (!entry || !g_cache_map.entries) return;
+    if (!entry || !g_cache.map.entries) return;
     
     unsigned int h = hash_djb2(entry->key.s, entry->key.len);
-    int idx = h % g_cache_map.capacity;
+    int idx = h % g_cache.map.capacity;
     
-    CacheEntry **pp = &g_cache_map.entries[idx];
+    CacheEntry **pp = &g_cache.map.entries[idx];
     while (*pp) {
         if (*pp == entry) {
             *pp = entry->hash_next;
-            g_cache_map.count--;
+            g_cache.map.count--;
             return;
         }
         pp = &((*pp)->hash_next);
@@ -133,15 +145,15 @@ static void lru_add_to_head(CacheEntry *entry) {
     if (!entry) return;
     
     entry->lru_prev = NULL;
-    entry->lru_next = g_lru_head;
+    entry->lru_next = g_cache.lru_head;
     
-    if (g_lru_head) {
-        g_lru_head->lru_prev = entry;
+    if (g_cache.lru_head) {
+        g_cache.lru_head->lru_prev = entry;
     }
-    g_lru_head = entry;
+    g_cache.lru_head = entry;
     
-    if (!g_lru_tail) {
-        g_lru_tail = entry;
+    if (!g_cache.lru_tail) {
+        g_cache.lru_tail = entry;
     }
 }
 
@@ -151,13 +163,13 @@ static void lru_remove(CacheEntry *entry) {
     if (entry->lru_prev) {
         entry->lru_prev->lru_next = entry->lru_next;
     } else {
-        g_lru_head = entry->lru_next;
+        g_cache.lru_head = entry->lru_next;
     }
     
     if (entry->lru_next) {
         entry->lru_next->lru_prev = entry->lru_prev;
     } else {
-        g_lru_tail = entry->lru_prev;
+        g_cache.lru_tail = entry->lru_prev;
     }
 }
 
@@ -168,11 +180,11 @@ static void lru_move_to_head(CacheEntry *entry) {
 }
 
 size_t cache_get_max_size(void) {
-    if (cache_mutex_lock(&g_cache_mutex, "get_max_size") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "get_max_size") != 0) {
         return 0;
     }
-    size_t out = g_cache_max_size;
-    (void)cache_mutex_unlock(&g_cache_mutex, "get_max_size(unlock)");
+    size_t out = g_cache.max_size;
+    (void)cache_mutex_unlock(&g_cache.mutex, "get_max_size(unlock)");
     return out;
 }
 
@@ -189,7 +201,7 @@ static int entry_can_delete(CacheEntry *entry) {
 }
 
 static CacheEntry *find_delete_candidate_locked(void) {
-    for (CacheEntry *e = g_lru_tail; e; e = e->lru_prev) {
+    for (CacheEntry *e = g_cache.lru_tail; e; e = e->lru_prev) {
         if (entry_can_delete(e)) {
             return e;
         }
@@ -214,7 +226,7 @@ static CacheEntry *cache_entry_create(const CacheKey *key) {
     entry->key.s[key->len] = '\0';
     entry->key.len = key->len;
     
-    entry->id = ++g_entry_id_counter;
+    entry->id = ++g_cache.entry_id_counter;
     entry->in_map = 1;
     entry->is_downloader_running = 0;
     entry->is_completed = 0;
@@ -275,14 +287,16 @@ static void cache_entry_destroy(CacheEntry *entry) {
     free(entry);
 }
 
-int cache_init(size_t max_size) {
-    g_cache_max_size = max_size;
-    g_cache_current_size = 0;
-    g_cache_map.entries = (CacheEntry **)calloc(32, sizeof(CacheEntry *));
-    g_cache_map.capacity = 32;
-    g_cache_map.count = 0;
+int cache_create(size_t max_size) {
+    g_cache.max_size = max_size;
+    g_cache.current_size = 0;
+    g_cache.map.entries = (CacheEntry **)calloc(32, sizeof(CacheEntry *));
+    g_cache.map.capacity = 32;
+    g_cache.map.count = 0;
+    g_cache.lru_head = NULL;
+    g_cache.lru_tail = NULL;
     
-    if (!g_cache_map.entries) {
+    if (!g_cache.map.entries) {
         return -1;
     }
     
@@ -293,7 +307,7 @@ int cache_init(size_t max_size) {
 CacheEntry *cache_lookup_or_create(CacheKey *key) {
     if (!key || !key->s) return NULL;
     
-    if (cache_mutex_lock(&g_cache_mutex, "lookup_or_create") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "lookup_or_create") != 0) {
         return NULL;
     }
     
@@ -302,14 +316,14 @@ CacheEntry *cache_lookup_or_create(CacheKey *key) {
     if (!entry) {
         entry = cache_entry_create(key);
         if (!entry) {
-            (void)cache_mutex_unlock(&g_cache_mutex, "lookup_or_create(create_fail_unlock)");
+            (void)cache_mutex_unlock(&g_cache.mutex, "lookup_or_create(create_fail_unlock)");
             fprintf(stderr, "[CACHE] Failed to create cache entry\n");
             return NULL;
         }
         
         if (cache_map_insert(entry) != 0) {
             cache_entry_destroy(entry);
-            (void)cache_mutex_unlock(&g_cache_mutex, "lookup_or_create(insert_fail_unlock)");
+            (void)cache_mutex_unlock(&g_cache.mutex, "lookup_or_create(insert_fail_unlock)");
             fprintf(stderr, "[CACHE] Failed to insert entry into cache\n");
             return NULL;
         }
@@ -324,7 +338,7 @@ CacheEntry *cache_lookup_or_create(CacheKey *key) {
                 entry->key.s, entry->id);
     }
     
-    (void)cache_mutex_unlock(&g_cache_mutex, "lookup_or_create(unlock)");
+    (void)cache_mutex_unlock(&g_cache.mutex, "lookup_or_create(unlock)");
     
     return entry;
 }
@@ -332,21 +346,21 @@ CacheEntry *cache_lookup_or_create(CacheKey *key) {
 int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
     if (!entry || !data || size == 0) return -1;
 
-    if (cache_mutex_lock(&g_cache_mutex, "append_chunk(get_max)") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "append_chunk(get_max)") != 0) {
         return -1;
     }
-    size_t max_size = g_cache_max_size;
-    (void)cache_mutex_unlock(&g_cache_mutex, "append_chunk(get_max_unlock)");
+    size_t max_size = g_cache.max_size;
+    (void)cache_mutex_unlock(&g_cache.mutex, "append_chunk(get_max_unlock)");
     if (max_size > 0 && size > max_size) {
         fprintf(stderr, "[CACHE] Chunk too large (%zu > %zu), refusing\n", size, max_size);
         return -2;
     }
 
     if (max_size > 0) {
-        if (cache_mutex_lock(&g_cache_mutex, "append_chunk(space_lock)") != 0) {
+        if (cache_mutex_lock(&g_cache.mutex, "append_chunk(space_lock)") != 0) {
             return -1;
         }
-        while (g_cache_current_size + size > g_cache_max_size) {
+        while (g_cache.current_size + size > g_cache.max_size) {
             gc_notify_pressure();
 
             struct timespec ts;
@@ -361,22 +375,22 @@ int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
                 ts.tv_nsec -= 1000000000L;
             }
 
-            int wrc = pthread_cond_timedwait(&g_cache_space_cond, &g_cache_mutex, &ts);
+            int wrc = pthread_cond_timedwait(&g_cache.space_cond, &g_cache.mutex, &ts);
             if (wrc != 0 && wrc != ETIMEDOUT) {
                 fprintf(stderr, "[CACHE] cond_timedwait failed: %s\n", strerror(wrc));
                 break;
             }
         }
-        g_cache_current_size += size;
-        (void)cache_mutex_unlock(&g_cache_mutex, "append_chunk(space_unlock)");
+        g_cache.current_size += size;
+        (void)cache_mutex_unlock(&g_cache.mutex, "append_chunk(space_unlock)");
     }
     
     if (cache_mutex_lock(&entry->m, "append_chunk(entry_lock)") != 0) {
         if (max_size > 0) {
-            if (cache_mutex_lock(&g_cache_mutex, "append_chunk(rollback_lock)") == 0) {
-                if (g_cache_current_size >= size) g_cache_current_size -= size;
-                (void)pthread_cond_broadcast(&g_cache_space_cond);
-                (void)cache_mutex_unlock(&g_cache_mutex, "append_chunk(rollback_unlock)");
+            if (cache_mutex_lock(&g_cache.mutex, "append_chunk(rollback_lock)") == 0) {
+                if (g_cache.current_size >= size) g_cache.current_size -= size;
+                (void)pthread_cond_broadcast(&g_cache.space_cond);
+                (void)cache_mutex_unlock(&g_cache.mutex, "append_chunk(rollback_unlock)");
             }
         }
         return -1;
@@ -400,11 +414,11 @@ int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
     if (!chunk) {
         (void)cache_mutex_unlock(&entry->m, "append_chunk(chunk_alloc_fail_unlock)");
         if (max_size > 0) {
-            if (cache_mutex_lock(&g_cache_mutex, "append_chunk(chunk_alloc_fail_cache_lock)") == 0) {
-            g_cache_current_size -= size;
-            int brc = pthread_cond_broadcast(&g_cache_space_cond);
+            if (cache_mutex_lock(&g_cache.mutex, "append_chunk(chunk_alloc_fail_cache_lock)") == 0) {
+            g_cache.current_size -= size;
+            int brc = pthread_cond_broadcast(&g_cache.space_cond);
             cache_log_pthread_rc("append_chunk(chunk_alloc_fail)", "pthread_cond_broadcast", brc);
-            (void)cache_mutex_unlock(&g_cache_mutex, "append_chunk(chunk_alloc_fail_cache_unlock)");
+            (void)cache_mutex_unlock(&g_cache.mutex, "append_chunk(chunk_alloc_fail_cache_unlock)");
             }
         }
         return -1;
@@ -415,11 +429,11 @@ int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
         free(chunk);
         (void)cache_mutex_unlock(&entry->m, "append_chunk(data_alloc_fail_unlock)");
         if (max_size > 0) {
-            if (cache_mutex_lock(&g_cache_mutex, "append_chunk(data_alloc_fail_cache_lock)") == 0) {
-            g_cache_current_size -= size;
-            int brc = pthread_cond_broadcast(&g_cache_space_cond);
+            if (cache_mutex_lock(&g_cache.mutex, "append_chunk(data_alloc_fail_cache_lock)") == 0) {
+            g_cache.current_size -= size;
+            int brc = pthread_cond_broadcast(&g_cache.space_cond);
             cache_log_pthread_rc("append_chunk(data_alloc_fail)", "pthread_cond_broadcast", brc);
-            (void)cache_mutex_unlock(&g_cache_mutex, "append_chunk(data_alloc_fail_cache_unlock)");
+            (void)cache_mutex_unlock(&g_cache.mutex, "append_chunk(data_alloc_fail_cache_unlock)");
             }
         }
         return -1;
@@ -540,35 +554,35 @@ void cache_remove_entry(CacheEntry *entry) {
     freed = entry->bytes_total;
     (void)cache_mutex_unlock(&entry->m, "remove_entry(entry_unlock)");
 
-    if (cache_mutex_lock(&g_cache_mutex, "remove_entry(cache_lock)") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "remove_entry(cache_lock)") != 0) {
         return;
     }
 
     lru_remove(entry);
     cache_map_remove(entry);
-    if (g_cache_current_size >= freed) {
-        g_cache_current_size -= freed;
+    if (g_cache.current_size >= freed) {
+        g_cache.current_size -= freed;
     } else {
-        g_cache_current_size = 0;
+        g_cache.current_size = 0;
     }
 
-    int brc = pthread_cond_broadcast(&g_cache_space_cond);
+    int brc = pthread_cond_broadcast(&g_cache.space_cond);
     cache_log_pthread_rc("remove_entry", "pthread_cond_broadcast", brc);
     fprintf(stdout, "[CACHE] Removed entry %lu\n", entry->id);
 
-    (void)cache_mutex_unlock(&g_cache_mutex, "remove_entry(cache_unlock)");
+    (void)cache_mutex_unlock(&g_cache.mutex, "remove_entry(cache_unlock)");
 
     cache_entry_destroy(entry);
 }
 
-void cache_cleanup(void) {
+void cache_destroy(void) {
     fprintf(stdout, "[CACHE] Cleanup\n");
     
-    if (cache_mutex_lock(&g_cache_mutex, "cleanup") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "cleanup") != 0) {
         return;
     }
     
-    CacheEntry *entry = g_lru_head;
+    CacheEntry *entry = g_cache.lru_head;
     while (entry) {
         CacheEntry *next = entry->lru_next;
         cache_map_remove(entry);
@@ -576,18 +590,18 @@ void cache_cleanup(void) {
         entry = next;
     }
     
-    g_lru_head = NULL;
-    g_lru_tail = NULL;
-    g_cache_map.count = 0;
-    g_cache_current_size = 0;
+    g_cache.lru_head = NULL;
+    g_cache.lru_tail = NULL;
+    g_cache.map.count = 0;
+    g_cache.current_size = 0;
 
-    int brc = pthread_cond_broadcast(&g_cache_space_cond);
+    int brc = pthread_cond_broadcast(&g_cache.space_cond);
     cache_log_pthread_rc("cleanup", "pthread_cond_broadcast", brc);
     
-    free(g_cache_map.entries);
-    g_cache_map.entries = NULL;
+    free(g_cache.map.entries);
+    g_cache.map.entries = NULL;
     
-    (void)cache_mutex_unlock(&g_cache_mutex, "cleanup(unlock)");
+    (void)cache_mutex_unlock(&g_cache.mutex, "cleanup(unlock)");
     
     fprintf(stdout, "[CACHE] Cleanup complete\n");
 }
@@ -595,15 +609,15 @@ void cache_cleanup(void) {
 int cache_trim_to_max(void) {
     int deleted = 0;
 
-    if (cache_mutex_lock(&g_cache_mutex, "trim_to_max") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "trim_to_max") != 0) {
         return 0;
     }
-    if (g_cache_max_size == 0) {
-        (void)cache_mutex_unlock(&g_cache_mutex, "trim_to_max(unlock_zero)");
+    if (g_cache.max_size == 0) {
+        (void)cache_mutex_unlock(&g_cache.mutex, "trim_to_max(unlock_zero)");
         return 0;
     }
 
-    while (g_cache_current_size > g_cache_max_size) {
+    while (g_cache.current_size > g_cache.max_size) {
         CacheEntry *cand = find_delete_candidate_locked();
         if (!cand) {
             break;
@@ -619,68 +633,68 @@ int cache_trim_to_max(void) {
         lru_remove(cand);
         cache_map_remove(cand);
 
-        if (g_cache_current_size >= freed) {
-            g_cache_current_size -= freed;
+        if (g_cache.current_size >= freed) {
+            g_cache.current_size -= freed;
         } else {
-            g_cache_current_size = 0;
+            g_cache.current_size = 0;
         }
 
-        int brc = pthread_cond_broadcast(&g_cache_space_cond);
+        int brc = pthread_cond_broadcast(&g_cache.space_cond);
         cache_log_pthread_rc("trim_to_max", "pthread_cond_broadcast", brc);
-        (void)cache_mutex_unlock(&g_cache_mutex, "trim_to_max(cache_unlock_before_destroy)");
+        (void)cache_mutex_unlock(&g_cache.mutex, "trim_to_max(cache_unlock_before_destroy)");
 
         cache_entry_destroy(cand);
         deleted++;
 
-        if (cache_mutex_lock(&g_cache_mutex, "trim_to_max(relock)") != 0) {
+        if (cache_mutex_lock(&g_cache.mutex, "trim_to_max(relock)") != 0) {
             return deleted;
         }
     }
 
-    (void)cache_mutex_unlock(&g_cache_mutex, "trim_to_max(unlock)");
+    (void)cache_mutex_unlock(&g_cache.mutex, "trim_to_max(unlock)");
     return deleted;
 }
 
 
 int cache_get_entry_count(void) {
-    if (cache_mutex_lock(&g_cache_mutex, "get_entry_count") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "get_entry_count") != 0) {
         return -1;
     }
-    int count = g_cache_map.count;
-    (void)cache_mutex_unlock(&g_cache_mutex, "get_entry_count(unlock)");
+    int count = g_cache.map.count;
+    (void)cache_mutex_unlock(&g_cache.mutex, "get_entry_count(unlock)");
     return count;
 }
 
 size_t cache_get_total_size(void) {
-    if (cache_mutex_lock(&g_cache_mutex, "get_total_size") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "get_total_size") != 0) {
         return 0;
     }
-    size_t size = g_cache_current_size;
-    (void)cache_mutex_unlock(&g_cache_mutex, "get_total_size(unlock)");
+    size_t size = g_cache.current_size;
+    (void)cache_mutex_unlock(&g_cache.mutex, "get_total_size(unlock)");
     return size;
 }
 
 void cache_print_stats(void) {
-    if (cache_mutex_lock(&g_cache_mutex, "print_stats") != 0) {
+    if (cache_mutex_lock(&g_cache.mutex, "print_stats") != 0) {
         return;
     }
     
     fprintf(stdout, "[CACHE STATS]\n");
-    fprintf(stdout, "  Entries: %d\n", g_cache_map.count);
-    fprintf(stdout, "  Total size: %zu / %zu bytes\n", g_cache_current_size, g_cache_max_size);
+        fprintf(stdout, "  Entries: %d\n", g_cache.map.count);
+        fprintf(stdout, "  Total size: %zu / %zu bytes\n", g_cache.current_size, g_cache.max_size);
     fprintf(stdout, "  Load: %.1f%%\n", 
-            g_cache_max_size > 0 ? (100.0 * g_cache_current_size / g_cache_max_size) : 0.0);
+            g_cache.max_size > 0 ? (100.0 * g_cache.current_size / g_cache.max_size) : 0.0);
     
     fprintf(stdout, "  LRU chain:\n");
     int i = 0;
-    for (CacheEntry *e = g_lru_head; e && i < 10; e = e->lru_next, i++) {
+    for (CacheEntry *e = g_cache.lru_head; e && i < 10; e = e->lru_next, i++) {
         fprintf(stdout, "    %d. %s (ID: %lu, size: %zu, status: %s)\n",
                 i + 1, e->key.s, e->id, e->produced,
                 e->is_completed ? "complete" : "incomplete");
     }
-    if (i == 10 && g_lru_head->lru_next) {
-        fprintf(stdout, "    ... and %d more\n", g_cache_map.count - 10);
+    if (i == 10 && g_cache.lru_head && g_cache.lru_head->lru_next) {
+        fprintf(stdout, "    ... and %d more\n", g_cache.map.count - 10);
     }
     
-    (void)cache_mutex_unlock(&g_cache_mutex, "print_stats(unlock)");
+    (void)cache_mutex_unlock(&g_cache.mutex, "print_stats(unlock)");
 }

@@ -3,10 +3,10 @@
 
 #include "types.h"
 
-int gc_init(size_t max_cache_size);
+int gc_create(size_t max_cache_size);
 
 void gc_notify_pressure(void);
 
-void gc_shutdown(void);
+void gc_destroy(void);
 
 #endif

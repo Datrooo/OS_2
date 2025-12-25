@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <pthread.h>
 #include <ev.h>
 
 #include "loop.h"
@@ -57,32 +58,51 @@ static char *normalize_target_origin_form(const char *target) {
     return xstrdup(path);
 }
 
-static struct ev_loop *g_loop = NULL;
-static int g_listen_fd = -1;
-static ev_io g_listen_watcher;
-static ev_async g_async_watcher;
-static ev_signal g_sigint_watcher;
-static ev_signal g_sigterm_watcher;
-
-static uint64_t g_session_counter = 0;
-
 typedef struct SessionNode {
     Session *sess;
     struct SessionNode *next;
 } SessionNode;
 
-static SessionNode *g_sessions = NULL;
+typedef struct ConnectWaitQueue {
+    pthread_mutex_t m;
+    struct ConnectWaitReq *head;
+    struct ConnectWaitReq *tail;
+} ConnectWaitQueue;
+
+typedef struct LoopState {
+    struct ev_loop *loop;
+    int listen_fd;
+    ev_io listen_watcher;
+    ev_async async_watcher;
+    ev_signal sigint_watcher;
+    ev_signal sigterm_watcher;
+    uint64_t session_counter;
+    SessionNode *sessions;
+    ConnectWaitQueue connect_q;
+} LoopState;
+
+static LoopState g_state = {
+    .loop = NULL,
+    .listen_fd = -1,
+    .session_counter = 0,
+    .sessions = NULL,
+    .connect_q = {
+        .m = PTHREAD_MUTEX_INITIALIZER,
+        .head = NULL,
+        .tail = NULL,
+    },
+};
 
 static void session_list_add(Session *s) {
     SessionNode *node = (SessionNode *)malloc(sizeof(SessionNode));
     if (!node) return;
     node->sess = s;
-    node->next = g_sessions;
-    g_sessions = node;
+    node->next = g_state.sessions;
+    g_state.sessions = node;
 }
 
 static void session_list_remove(Session *s) {
-    SessionNode **pp = &g_sessions;
+    SessionNode **pp = &g_state.sessions;
     while (*pp) {
         if ((*pp)->sess == s) {
             SessionNode *tmp = *pp;
@@ -94,15 +114,85 @@ static void session_list_remove(Session *s) {
     }
 }
 
+typedef struct ConnectWaitReq {
+    int fd;
+    double timeout_sec;
+    int done;
+    int soerr;
+    int timed_out;
+    pthread_mutex_t m;
+    pthread_cond_t cv;
+    ev_io io;
+    ev_timer timer;
+    struct ConnectWaitReq *next;
+} ConnectWaitReq;
+
+static void connect_wait_finish(ConnectWaitReq *req, int timed_out, int soerr) {
+    if (!req) return;
+    pthread_mutex_lock(&req->m);
+    req->done = 1;
+    req->timed_out = timed_out;
+    req->soerr = soerr;
+    pthread_cond_signal(&req->cv);
+    pthread_mutex_unlock(&req->m);
+}
+
+static void connect_wait_io_cb(EV_P_ ev_io *w, int revents) {
+    (void)revents;
+    ConnectWaitReq *req = (ConnectWaitReq *)w->data;
+    if (!req) return;
+
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    if (getsockopt(req->fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0) {
+        soerr = errno;
+    }
+
+    ev_io_stop(EV_A_ &req->io);
+    ev_timer_stop(EV_A_ &req->timer);
+    connect_wait_finish(req, 0, soerr);
+}
+
+static void connect_wait_timer_cb(EV_P_ ev_timer *w, int revents) {
+    (void)revents;
+    ConnectWaitReq *req = (ConnectWaitReq *)w->data;
+    if (!req) return;
+    ev_io_stop(EV_A_ &req->io);
+    ev_timer_stop(EV_A_ &req->timer);
+    connect_wait_finish(req, 1, ETIMEDOUT);
+}
+
 static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
     (void)w;
     (void)revents;
     int processed = dirty_process_all();
+
+    ConnectWaitReq *local_head = NULL;
+    pthread_mutex_lock(&g_state.connect_q.m);
+    local_head = (ConnectWaitReq *)g_state.connect_q.head;
+    g_state.connect_q.head = NULL;
+    g_state.connect_q.tail = NULL;
+    pthread_mutex_unlock(&g_state.connect_q.m);
+
+    while (local_head) {
+        ConnectWaitReq *req = local_head;
+        local_head = local_head->next;
+        req->next = NULL;
+
+        ev_io_init(&req->io, connect_wait_io_cb, req->fd, EV_WRITE);
+        req->io.data = req;
+        ev_timer_init(&req->timer, connect_wait_timer_cb, req->timeout_sec, 0.0);
+        req->timer.data = req;
+
+        ev_io_start(loop, &req->io);
+        ev_timer_start(loop, &req->timer);
+    }
+
     if (processed <= 0) {
         return;
     }
 
-    SessionNode *node = g_sessions;
+    SessionNode *node = g_state.sessions;
     while (node) {
         Session *s = node->sess;
         if (s->state == SESSION_STREAMING && s->entry && !s->write_active) {
@@ -366,7 +456,7 @@ static void accept_callback(struct ev_loop *loop, ev_io *w, int revents) {
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     
-    int client_fd = accept(g_listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
+    int client_fd = accept(g_state.listen_fd, (struct sockaddr *)&client_addr, &client_addr_len);
     if (client_fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return;
@@ -382,7 +472,7 @@ static void accept_callback(struct ev_loop *loop, ev_io *w, int revents) {
         return;
     }
     
-    s->id = ++g_session_counter;
+    s->id = ++g_state.session_counter;
     
     char client_ip[INET_ADDRSTRLEN];
     if (!inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip))) {
@@ -406,79 +496,124 @@ static void accept_callback(struct ev_loop *loop, ev_io *w, int revents) {
     session_list_add(s);
 }
 
-int loop_init(const char *bind_ip, int listen_port) {
-    g_listen_fd = net_listen_on(bind_ip, listen_port);
-    if (g_listen_fd < 0) {
+int loop_create(const char *bind_ip, int listen_port) {
+    g_state.listen_fd = net_listen_on(bind_ip, listen_port);
+    if (g_state.listen_fd < 0) {
         fprintf(stderr, "Failed to create listen socket\n");
         return -1;
     }
     
-    fprintf(stdout, "Listen socket created: fd=%d, port=%d\n", g_listen_fd, listen_port);
+    fprintf(stdout, "Listen socket created: fd=%d, port=%d\n", g_state.listen_fd, listen_port);
 
-    if (net_set_nonblocking(g_listen_fd, "LISTEN") != 0) {
-        close(g_listen_fd);
-        g_listen_fd = -1;
+    if (net_set_nonblocking(g_state.listen_fd, "LISTEN") != 0) {
+        close(g_state.listen_fd);
+        g_state.listen_fd = -1;
         return -1;
     }
     
-    g_loop = ev_loop_new(0);
-    if (!g_loop) {
+    g_state.loop = ev_loop_new(0);
+    if (!g_state.loop) {
         fprintf(stderr, "Failed to create event loop\n");
-        close(g_listen_fd);
-        g_listen_fd = -1;
+        close(g_state.listen_fd);
+        g_state.listen_fd = -1;
         return -1;
     }
     
-    ev_io_init(&g_listen_watcher, accept_callback, g_listen_fd, EV_READ);
-    ev_io_start(g_loop, &g_listen_watcher);
+    ev_io_init(&g_state.listen_watcher, accept_callback, g_state.listen_fd, EV_READ);
+    ev_io_start(g_state.loop, &g_state.listen_watcher);
     
-    ev_async_init(&g_async_watcher, async_callback);
-    ev_async_start(g_loop, &g_async_watcher);
+    ev_async_init(&g_state.async_watcher, async_callback);
+    ev_async_start(g_state.loop, &g_state.async_watcher);
 
-    ev_signal_init(&g_sigint_watcher, signal_callback, SIGINT);
-    ev_signal_start(g_loop, &g_sigint_watcher);
-    ev_signal_init(&g_sigterm_watcher, signal_callback, SIGTERM);
-    ev_signal_start(g_loop, &g_sigterm_watcher);
+    ev_signal_init(&g_state.sigint_watcher, signal_callback, SIGINT);
+    ev_signal_start(g_state.loop, &g_state.sigint_watcher);
+    ev_signal_init(&g_state.sigterm_watcher, signal_callback, SIGTERM);
+    ev_signal_start(g_state.loop, &g_state.sigterm_watcher);
     
     return 0;
 }
 
 int loop_run(void) {
-    if (!g_loop) return -1;
+    if (!g_state.loop) return -1;
     
-    ev_run(g_loop, 0);
+    ev_run(g_state.loop, 0);
     
     return 0;
 }
 
 void loop_stop(void) {
-    if (!g_loop) return;
+    if (!g_state.loop) return;
     
-    ev_break(g_loop, EVBREAK_ALL);
+    ev_break(g_state.loop, EVBREAK_ALL);
 }
 
-void loop_shutdown(void) {
-    if (g_loop) {
-        ev_signal_stop(g_loop, &g_sigterm_watcher);
-        ev_signal_stop(g_loop, &g_sigint_watcher);
-        ev_async_stop(g_loop, &g_async_watcher);
-        ev_io_stop(g_loop, &g_listen_watcher);
-        ev_break(g_loop, EVBREAK_ALL);
-        ev_loop_destroy(g_loop);
-        g_loop = NULL;
+void loop_destroy(void) {
+    if (g_state.loop) {
+        ev_signal_stop(g_state.loop, &g_state.sigterm_watcher);
+        ev_signal_stop(g_state.loop, &g_state.sigint_watcher);
+        ev_async_stop(g_state.loop, &g_state.async_watcher);
+        ev_io_stop(g_state.loop, &g_state.listen_watcher);
+        ev_break(g_state.loop, EVBREAK_ALL);
+        ev_loop_destroy(g_state.loop);
+        g_state.loop = NULL;
     }
 
-    if (g_listen_fd >= 0) {
-        close(g_listen_fd);
-        g_listen_fd = -1;
+    if (g_state.listen_fd >= 0) {
+        close(g_state.listen_fd);
+        g_state.listen_fd = -1;
     }
 }
 
 struct ev_loop *loop_get(void) {
-    return g_loop;
+    return g_state.loop;
 }
 
 void loop_notify_dirty(void) {
-    if (!g_loop) return;
-    ev_async_send(g_loop, &g_async_watcher);
+    if (!g_state.loop) return;
+    ev_async_send(g_state.loop, &g_state.async_watcher);
+}
+
+int loop_wait_connect(int fd, double timeout_sec, int *out_soerr) {
+    if (out_soerr) *out_soerr = 0;
+    if (!g_state.loop || fd < 0) {
+        return -1;
+    }
+
+    ConnectWaitReq *req = (ConnectWaitReq *)calloc(1, sizeof(*req));
+    if (!req) return -1;
+    req->fd = fd;
+    req->timeout_sec = timeout_sec;
+    req->done = 0;
+    req->soerr = 0;
+    req->timed_out = 0;
+    pthread_mutex_init(&req->m, NULL);
+    pthread_cond_init(&req->cv, NULL);
+    req->next = NULL;
+
+    pthread_mutex_lock(&g_state.connect_q.m);
+    if (!g_state.connect_q.tail) {
+        g_state.connect_q.head = req;
+        g_state.connect_q.tail = req;
+    } else {
+        ((ConnectWaitReq *)g_state.connect_q.tail)->next = req;
+        g_state.connect_q.tail = req;
+    }
+    pthread_mutex_unlock(&g_state.connect_q.m);
+
+    ev_async_send(g_state.loop, &g_state.async_watcher);
+
+    pthread_mutex_lock(&req->m);
+    while (!req->done) {
+        pthread_cond_wait(&req->cv, &req->m);
+    }
+    int timed_out = req->timed_out;
+    int soerr = req->soerr;
+    pthread_mutex_unlock(&req->m);
+
+    pthread_cond_destroy(&req->cv);
+    pthread_mutex_destroy(&req->m);
+    free(req);
+
+    if (out_soerr) *out_soerr = soerr;
+    return timed_out ? 1 : 0;
 }

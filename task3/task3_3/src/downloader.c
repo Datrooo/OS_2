@@ -12,12 +12,12 @@
 #include <errno.h>
 #include <stdint.h>
 #include <fcntl.h>
-#include <ev.h>
 
 #include "downloader.h"
 #include "cache.h"
 #include "dirty.h"
 #include "net.h"
+#include "loop.h"
 
 #define DOWNLOADER_THREAD_COUNT 4
 #define DOWNLOADER_QUEUE_SIZE 1024
@@ -25,93 +25,6 @@
 #define ORIGIN_HEADER_MAX 16384
 #define CONNECT_TIMEOUT_SEC 5.0
 
-typedef struct {
-    struct ev_loop *loop;
-    ev_io io;
-    ev_timer timer;
-    int fd;
-    int fired;
-    int timed_out;
-    int soerr;
-} ConnectWaitCtx;
-
-static void connect_wait_stop(ConnectWaitCtx *ctx) {
-    if (!ctx || !ctx->loop) return;
-    ev_io_stop(ctx->loop, &ctx->io);
-    ev_timer_stop(ctx->loop, &ctx->timer);
-}
-
-static void connect_wait_io_cb(EV_P_ ev_io *w, int revents) {
-    (void)revents;
-    ConnectWaitCtx *ctx = (ConnectWaitCtx *)w->data;
-    if (!ctx) {
-        ev_break(EV_A_ EVBREAK_ONE);
-        return;
-    }
-
-    int soerr = 0;
-    socklen_t slen = sizeof(soerr);
-    if (getsockopt(ctx->fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0) {
-        ctx->soerr = errno;
-    } else {
-        ctx->soerr = soerr;
-    }
-
-    ctx->fired = 1;
-    ctx->timed_out = 0;
-    connect_wait_stop(ctx);
-    ev_break(EV_A_ EVBREAK_ONE);
-}
-
-static void connect_wait_timer_cb(EV_P_ ev_timer *w, int revents) {
-    (void)revents;
-    ConnectWaitCtx *ctx = (ConnectWaitCtx *)w->data;
-    if (!ctx) {
-        ev_break(EV_A_ EVBREAK_ONE);
-        return;
-    }
-    ctx->fired = 1;
-    ctx->timed_out = 1;
-    ctx->soerr = ETIMEDOUT;
-    connect_wait_stop(ctx);
-    ev_break(EV_A_ EVBREAK_ONE);
-}
-
-static int wait_connect_writable_libev(int fd, double timeout_sec, int *out_soerr) {
-    if (out_soerr) *out_soerr = 0;
-
-    struct ev_loop *loop = ev_loop_new(0);
-    if (!loop) {
-        return -1;
-    }
-
-    ConnectWaitCtx ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.loop = loop;
-    ctx.fd = fd;
-    ctx.soerr = 0;
-
-    ev_io_init(&ctx.io, connect_wait_io_cb, fd, EV_WRITE);
-    ctx.io.data = &ctx;
-    ev_timer_init(&ctx.timer, connect_wait_timer_cb, timeout_sec, 0.0);
-    ctx.timer.data = &ctx;
-
-    ev_io_start(loop, &ctx.io);
-    ev_timer_start(loop, &ctx.timer);
-    ev_run(loop, 0);
-
-    ev_loop_destroy(loop);
-
-    if (!ctx.fired) {
-        return -1;
-    }
-
-    if (out_soerr) {
-        *out_soerr = ctx.soerr;
-    }
-
-    return ctx.timed_out ? 1 : 0;
-}
 
 static int find_header_end_len(const char *buf, size_t len, size_t *out_header_len) {
     if (!buf || len < 4) return 0;
@@ -134,61 +47,67 @@ typedef struct {
     int shutdown_flag;
 } TaskQueue;
 
-static TaskQueue g_task_queue = {
-    .head = 0,
-    .tail = 0,
-    .count = 0,
-    .shutdown_flag = 0
-};
+typedef struct DownloaderState {
+    TaskQueue q;
+    pthread_t threads[DOWNLOADER_THREAD_COUNT];
+    int initialized;
+} DownloaderState;
 
-static pthread_t g_downloader_threads[DOWNLOADER_THREAD_COUNT];
-static int g_downloader_initialized = 0;
+static DownloaderState g_downloader = {
+    .q = {
+        .head = 0,
+        .tail = 0,
+        .count = 0,
+        .shutdown_flag = 0,
+    },
+    .initialized = 0,
+};
 
 
 static int task_queue_enqueue(DownloadTask *task) {
-    pthread_mutex_lock(&g_task_queue.m);
+    pthread_mutex_lock(&g_downloader.q.m);
     
-    if (g_task_queue.count >= DOWNLOADER_QUEUE_SIZE) {
-        pthread_mutex_unlock(&g_task_queue.m);
+    if (g_downloader.q.count >= DOWNLOADER_QUEUE_SIZE) {
+        pthread_mutex_unlock(&g_downloader.q.m);
         fprintf(stderr, "[DL] Task queue full\n");
         return -1;
     }
     
-    g_task_queue.tasks[g_task_queue.tail] = *task;
-    g_task_queue.tail = (g_task_queue.tail + 1) % DOWNLOADER_QUEUE_SIZE;
-    g_task_queue.count++;
+    g_downloader.q.tasks[g_downloader.q.tail] = *task;
+    g_downloader.q.tail = (g_downloader.q.tail + 1) % DOWNLOADER_QUEUE_SIZE;
+    g_downloader.q.count++;
     
-    pthread_cond_signal(&g_task_queue.cond);
-    pthread_mutex_unlock(&g_task_queue.m);
+    pthread_cond_signal(&g_downloader.q.cond);
+    pthread_mutex_unlock(&g_downloader.q.m);
     
     return 0;
 }
 
 static int task_queue_dequeue(DownloadTask *task) {
-    pthread_mutex_lock(&g_task_queue.m);
+    pthread_mutex_lock(&g_downloader.q.m);
     
-    while (g_task_queue.count == 0 && !g_task_queue.shutdown_flag) {
-        pthread_cond_wait(&g_task_queue.cond, &g_task_queue.m);
+    while (g_downloader.q.count == 0 && !g_downloader.q.shutdown_flag) {
+        pthread_cond_wait(&g_downloader.q.cond, &g_downloader.q.m);
     }
     
-    if (g_task_queue.count == 0) {
-        pthread_mutex_unlock(&g_task_queue.m);
+    if (g_downloader.q.count == 0) {
+        pthread_mutex_unlock(&g_downloader.q.m);
         return -1;
     }
     
-    *task = g_task_queue.tasks[g_task_queue.head];
-    g_task_queue.head = (g_task_queue.head + 1) % DOWNLOADER_QUEUE_SIZE;
-    g_task_queue.count--;
+    *task = g_downloader.q.tasks[g_downloader.q.head];
+    g_downloader.q.head = (g_downloader.q.head + 1) % DOWNLOADER_QUEUE_SIZE;
+    g_downloader.q.count--;
     
-    pthread_mutex_unlock(&g_task_queue.m);
+    pthread_mutex_unlock(&g_downloader.q.m);
     
     return 0;
 }
 
 static int task_queue_size(void) {
-    pthread_mutex_lock(&g_task_queue.m);
-    int size = g_task_queue.count;
-    pthread_mutex_unlock(&g_task_queue.m);
+    pthread_mutex_lock(&g_downloader.q.m);
+    int size = g_downloader.q.count;
+    pthread_mutex_unlock(&g_downloader.q.m);
     return size;
 }
 
@@ -257,9 +176,9 @@ static int origin_connect(const char *host, int port) {
 
         if (rc_conn < 0 && errno == EINPROGRESS) {
             int soerr = 0;
-            int wrc = wait_connect_writable_libev(fd, CONNECT_TIMEOUT_SEC, &soerr);
+            int wrc = loop_wait_connect(fd, CONNECT_TIMEOUT_SEC, &soerr);
             if (wrc < 0) {
-                fprintf(stderr, "[DL] libev connect-wait failed\n");
+                fprintf(stderr, "[DL] loop connect-wait failed\n");
             } else if (wrc > 0) {
                 fprintf(stderr, "[DL] connect timeout\n");
             } else if (soerr == 0) {
@@ -587,35 +506,69 @@ static void *downloader_worker(void *arg) {
     return NULL;
 }
 
-int downloader_init(void) {
-    if (g_downloader_initialized) {
-        return 0;
-    }
-    
-    if (pthread_mutex_init(&g_task_queue.m, NULL) != 0) {
+static int downloader_state_create(DownloaderState *st) {
+    if (!st) return -1;
+    if (st->initialized) return 0;
+
+    if (pthread_mutex_init(&st->q.m, NULL) != 0) {
         fprintf(stderr, "[DL] pthread_mutex_init failed\n");
         return -1;
     }
-    if (pthread_cond_init(&g_task_queue.cond, NULL) != 0) {
+    if (pthread_cond_init(&st->q.cond, NULL) != 0) {
         fprintf(stderr, "[DL] pthread_cond_init failed\n");
-        pthread_mutex_destroy(&g_task_queue.m);
+        pthread_mutex_destroy(&st->q.m);
         return -1;
     }
-    
-    g_task_queue.shutdown_flag = 0;
-    
+
+    st->q.head = 0;
+    st->q.tail = 0;
+    st->q.count = 0;
+    st->q.shutdown_flag = 0;
+
     for (int i = 0; i < DOWNLOADER_THREAD_COUNT; i++) {
-        if (pthread_create(&g_downloader_threads[i], NULL, downloader_worker, (void *)(intptr_t)i) != 0) {
+        if (pthread_create(&st->threads[i], NULL, downloader_worker, (void *)(intptr_t)i) != 0) {
             fprintf(stderr, "[DL] Failed to create worker thread %d\n", i);
+            st->q.shutdown_flag = 1;
+            pthread_cond_broadcast(&st->q.cond);
+            for (int j = 0; j < i; j++) {
+                pthread_join(st->threads[j], NULL);
+            }
+            pthread_cond_destroy(&st->q.cond);
+            pthread_mutex_destroy(&st->q.m);
             return -1;
         }
     }
-    
-    g_downloader_initialized = 1;
-    
+
+    st->initialized = 1;
     fprintf(stdout, "[DL] Downloader pool initialized (%d threads)\n", DOWNLOADER_THREAD_COUNT);
-    
     return 0;
+}
+
+static void downloader_state_destroy(DownloaderState *st) {
+    if (!st || !st->initialized) {
+        return;
+    }
+
+    fprintf(stdout, "[DL] Shutting down downloader pool\n");
+
+    pthread_mutex_lock(&st->q.m);
+    st->q.shutdown_flag = 1;
+    pthread_cond_broadcast(&st->q.cond);
+    pthread_mutex_unlock(&st->q.m);
+
+    for (int i = 0; i < DOWNLOADER_THREAD_COUNT; i++) {
+        pthread_join(st->threads[i], NULL);
+    }
+
+    pthread_cond_destroy(&st->q.cond);
+    pthread_mutex_destroy(&st->q.m);
+
+    st->initialized = 0;
+    fprintf(stdout, "[DL] Downloader pool shut down\n");
+}
+
+int downloader_create(void) {
+    return downloader_state_create(&g_downloader);
 }
 
 int downloader_enqueue(CacheEntry *entry, int urgency) {
@@ -634,25 +587,8 @@ int downloader_enqueue(CacheEntry *entry, int urgency) {
     return task_queue_enqueue(&task);
 }
 
-void downloader_shutdown(void) {
-    if (!g_downloader_initialized) {
-        return;
-    }
-    
-    fprintf(stdout, "[DL] Shutting down downloader pool\n");
-    
-    pthread_mutex_lock(&g_task_queue.m);
-    g_task_queue.shutdown_flag = 1;
-    pthread_cond_broadcast(&g_task_queue.cond);
-    pthread_mutex_unlock(&g_task_queue.m);
-    
-    for (int i = 0; i < DOWNLOADER_THREAD_COUNT; i++) {
-        pthread_join(g_downloader_threads[i], NULL);
-    }
-    
-    fprintf(stdout, "[DL] Downloader pool shut down\n");
-    
-    g_downloader_initialized = 0;
+void downloader_destroy(void) {
+    downloader_state_destroy(&g_downloader);
 }
 
 int downloader_get_queue_size(void) {

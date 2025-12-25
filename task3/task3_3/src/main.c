@@ -60,35 +60,35 @@ int main(int argc, char *argv[]) {
     print_config(bind_ip, port);
 
     do {
-        if (cache_init(MAX_CACHE_SIZE) != 0) {
+        if (cache_create(MAX_CACHE_SIZE) != 0) {
             fprintf(stderr, "Failed to initialize cache\n");
             break;
         }
         cache_inited = 1;
         fprintf(stdout, "Cache initialized (%.1f MB)\n", MAX_CACHE_SIZE / 1024.0 / 1024.0);
 
-        if (dirty_init() != 0) {
+        if (dirty_create() != 0) {
             fprintf(stderr, "Failed to initialize dirty queue\n");
             break;
         }
         dirty_inited = 1;
         fprintf(stdout, "Dirty queue initialized\n");
 
-        if (downloader_init() != 0) {
+        if (downloader_create() != 0) {
             fprintf(stderr, "Failed to initialize downloader pool\n");
             break;
         }
         downloader_inited = 1;
         fprintf(stdout, "Downloader pool initialized (%d threads)\n", DOWNLOADER_POOL_SIZE);
 
-        if (gc_init(MAX_CACHE_SIZE) != 0) {
+        if (gc_create(MAX_CACHE_SIZE) != 0) {
             fprintf(stderr, "Failed to initialize GC\n");
             break;
         }
         gc_inited = 1;
         fprintf(stdout, "GC (Garbage Collector) initialized\n");
 
-        if (loop_init(bind_ip, port) != 0) {
+        if (loop_create(bind_ip, port) != 0) {
             fprintf(stderr, "Failed to initialize event loop\n");
             break;
         }
@@ -104,27 +104,27 @@ int main(int argc, char *argv[]) {
     }
     
     if (loop_inited) {
-        loop_shutdown();
+        loop_destroy();
         loop_inited = 0;
     }
 
     if (downloader_inited) {
-        downloader_shutdown();
+        downloader_destroy();
         downloader_inited = 0;
     }
 
     if (gc_inited) {
-        gc_shutdown();
+        gc_destroy();
         gc_inited = 0;
     }
 
     if (dirty_inited) {
-        dirty_cleanup();
+        dirty_destroy();
         dirty_inited = 0;
     }
 
     if (cache_inited) {
-        cache_cleanup();
+        cache_destroy();
         cache_inited = 0;
     }
     

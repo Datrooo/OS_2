@@ -11,11 +11,11 @@
    5. Mark complete via cache_entry_complete()
     */
 
-int downloader_init(void);
+int downloader_create(void);
 
 int downloader_enqueue(CacheEntry *entry, int urgency);
 
-void downloader_shutdown(void);
+void downloader_destroy(void);
 
 int downloader_get_queue_size(void);
 

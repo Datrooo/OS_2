@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -pthread -std=c99 -Iinclude
+CFLAGS = -Wall -Wextra -O2 -pthread -Iinclude
 LDFLAGS = -lev -lpthread
 
 SOURCES = src/main.c src/loop.c src/session.c src/cache.c src/key_builder.c \

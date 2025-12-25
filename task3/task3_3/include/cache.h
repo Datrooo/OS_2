@@ -3,7 +3,7 @@
 
 #include "types.h"
 
-int cache_init(size_t max_size);
+int cache_create(size_t max_size);
 
 CacheEntry *cache_lookup_or_create(CacheKey *key);
 
@@ -21,7 +21,7 @@ const char *cache_entry_get_content_type(CacheEntry *entry);
 
 void cache_remove_entry(CacheEntry *entry);
 
-void cache_cleanup(void);
+void cache_destroy(void);
 
 
 int cache_trim_to_max(void);
