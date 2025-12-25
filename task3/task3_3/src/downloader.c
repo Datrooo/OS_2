@@ -279,6 +279,31 @@ static void parse_status_and_content_type(const char *hdr, size_t hdr_len,
     free(tmp);
 }
 
+static size_t parse_content_length(const char *hdr, size_t hdr_len) {
+    if (!hdr || hdr_len == 0) return 0;
+
+    char *tmp = (char *)malloc(hdr_len + 1);
+    if (!tmp) return 0;
+    memcpy(tmp, hdr, hdr_len);
+    tmp[hdr_len] = '\0';
+
+    const char *cl_start = strstr(tmp, "Content-Length:");
+    if (!cl_start) cl_start = strstr(tmp, "content-length:");
+    size_t out = 0;
+    if (cl_start) {
+        cl_start += 15;
+        while (*cl_start == ' ' || *cl_start == '\t') cl_start++;
+        errno = 0;
+        unsigned long long v = strtoull(cl_start, NULL, 10);
+        if (errno == 0) {
+            out = (size_t)v;
+        }
+    }
+
+    free(tmp);
+    return out;
+}
+
 static void *downloader_worker(void *arg) {
     int thread_id = (intptr_t)arg;
     
@@ -362,6 +387,10 @@ static void *downloader_worker(void *arg) {
         int header_parsed = 0;
         int response_status = 200;
         char *content_type = NULL;
+        size_t content_length = 0;
+        size_t stored_bytes = 0;
+        int aborted = 0;
+        size_t max_cache_size = cache_get_max_size();
 
         char header_buf[ORIGIN_HEADER_MAX];
         size_t header_buf_len = 0;
@@ -411,9 +440,13 @@ static void *downloader_worker(void *arg) {
                 header_parsed = 1;
 
                 parse_status_and_content_type(header_buf, header_len, &response_status, &content_type);
+                content_length = parse_content_length(header_buf, header_len);
                 fprintf(stdout, "[DL] Response status: %d\n", response_status);
                 if (content_type) {
                     fprintf(stdout, "[DL] Content-Type: %s\n", content_type);
+                }
+                if (content_length > 0) {
+                    fprintf(stdout, "[DL] Content-Length: %zu\n", content_length);
                 }
 
                 // store exact origin header for clients
@@ -430,47 +463,105 @@ static void *downloader_worker(void *arg) {
                     entry->resp_header_len = 0;
                 }
                 entry->http_status = response_status;
+                entry->content_length = content_length;
                 entry->header_ready = 1;
                 pthread_mutex_unlock(&entry->m);
 
+                if (max_cache_size > 0 && content_length > max_cache_size) {
+                    fprintf(stderr,
+                            "[DL] Huge object for entry %lu (%s): Content-Length=%zu > cache_max=%zu; aborting\n",
+                            entry->id,
+                            entry->key.s ? entry->key.s : "(null)",
+                            content_length,
+                            max_cache_size);
+                    cache_entry_failed(entry);
+                    aborted = 1;
+                    break;
+                }
+
                 size_t spill = header_buf_len - header_len;
                 if (spill > 0) {
+                    if (max_cache_size > 0 && stored_bytes + spill > max_cache_size) {
+                        fprintf(stderr,
+                                "[DL] Huge object for entry %lu (%s): streamed_bytes=%zu + spill=%zu > cache_max=%zu; aborting\n",
+                                entry->id,
+                                entry->key.s ? entry->key.s : "(null)",
+                                stored_bytes,
+                                spill,
+                                max_cache_size);
+                        cache_entry_failed(entry);
+                        aborted = 1;
+                        break;
+                    }
                     int rc = cache_append_chunk(entry, (const uint8_t *)(header_buf + header_len), spill);
                     if (rc == -2) {
                         fprintf(stderr, "[DL] Entry %lu exceeds cache capacity; aborting\n", entry->id);
                         cache_entry_failed(entry);
+                        aborted = 1;
                         break;
                     } else if (rc != 0) {
                         fprintf(stderr, "[DL] Failed to append spill chunk\n");
                         cache_entry_failed(entry);
+                        aborted = 1;
                         break;
                     }
+                    stored_bytes += spill;
                 }
 
                 if ((size_t)n > can_copy) {
                     size_t rem = (size_t)n - can_copy;
+                    if (max_cache_size > 0 && stored_bytes + rem > max_cache_size) {
+                        fprintf(stderr,
+                                "[DL] Huge object for entry %lu (%s): streamed_bytes=%zu + rem=%zu > cache_max=%zu; aborting\n",
+                                entry->id,
+                                entry->key.s ? entry->key.s : "(null)",
+                                stored_bytes,
+                                rem,
+                                max_cache_size);
+                        cache_entry_failed(entry);
+                        aborted = 1;
+                        break;
+                    }
                     int rc = cache_append_chunk(entry, buffer + can_copy, rem);
                     if (rc == -2) {
                         fprintf(stderr, "[DL] Entry %lu exceeds cache capacity; aborting\n", entry->id);
                         cache_entry_failed(entry);
+                        aborted = 1;
                         break;
                     } else if (rc != 0) {
                         fprintf(stderr, "[DL] Failed to append data chunk\n");
                         cache_entry_failed(entry);
+                        aborted = 1;
                         break;
                     }
+                    stored_bytes += rem;
                 }
             } else {
+                if (max_cache_size > 0 && stored_bytes + (size_t)n > max_cache_size) {
+                    fprintf(stderr,
+                            "[DL] Huge object for entry %lu (%s): streamed_bytes=%zu + chunk=%zu > cache_max=%zu; aborting\n",
+                            entry->id,
+                            entry->key.s ? entry->key.s : "(null)",
+                            stored_bytes,
+                            (size_t)n,
+                            max_cache_size);
+                    cache_entry_failed(entry);
+                    aborted = 1;
+                    break;
+                }
                 int rc = cache_append_chunk(entry, buffer, n);
                 if (rc == -2) {
                     fprintf(stderr, "[DL] Entry %lu exceeds cache capacity; aborting\n", entry->id);
                     cache_entry_failed(entry);
+                    aborted = 1;
                     break;
                 } else if (rc != 0) {
                     fprintf(stderr, "[DL] Failed to append data chunk\n");
                     cache_entry_failed(entry);
+                    aborted = 1;
                     break;
                 }
+                stored_bytes += (size_t)n;
             }
             
             pthread_mutex_lock(&entry->m);
@@ -478,11 +569,13 @@ static void *downloader_worker(void *arg) {
             pthread_mutex_unlock(&entry->m);
             dirty_enqueue(entry);
         }
-        
-        if (header_parsed) {
-            cache_entry_complete(entry, response_status, content_type);
-        } else {
-            cache_entry_failed(entry);
+
+        if (!aborted) {
+            if (header_parsed) {
+                cache_entry_complete(entry, response_status, content_type);
+            } else {
+                cache_entry_failed(entry);
+            }
         }
         
         if (content_type) {
