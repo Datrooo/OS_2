@@ -104,13 +104,6 @@ static int task_queue_dequeue(DownloadTask *task) {
     return 0;
 }
 
-static int task_queue_size(void) {
-    pthread_mutex_lock(&g_downloader.q.m);
-    int size = g_downloader.q.count;
-    pthread_mutex_unlock(&g_downloader.q.m);
-    return size;
-}
-
 static int origin_connect(const char *host, int port) {
     fprintf(stdout, "[DL] Connecting to %s:%d\n", host, port);
 
@@ -682,8 +675,4 @@ int downloader_enqueue(CacheEntry *entry, int urgency) {
 
 void downloader_destroy(void) {
     downloader_state_destroy(&g_downloader);
-}
-
-int downloader_get_queue_size(void) {
-    return task_queue_size();
 }

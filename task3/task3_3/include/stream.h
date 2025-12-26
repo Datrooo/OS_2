@@ -13,8 +13,6 @@ int stream_send_header(Session *session);
 // returns bytes sent or error
 int stream_send_body(Session *session);
 
-size_t stream_get_content_length(CacheEntry *entry);
-
 int stream_can_send_more(Session *session);
 
 #endif

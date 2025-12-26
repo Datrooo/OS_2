@@ -17,6 +17,4 @@ int downloader_enqueue(CacheEntry *entry, int urgency);
 
 void downloader_destroy(void);
 
-int downloader_get_queue_size(void);
-
 #endif

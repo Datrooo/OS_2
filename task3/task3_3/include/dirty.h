@@ -14,8 +14,6 @@ int dirty_enqueue(CacheEntry *entry);
 
 int dirty_process_all(void);
 
-int dirty_get_queue_size(void);
-
 void dirty_destroy(void);
 
 #endif

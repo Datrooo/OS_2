@@ -169,15 +169,6 @@ int dirty_process_all(void) {
     return count;
 }
 
-int dirty_get_queue_size(void) {
-    if (dirty_mutex_lock(&g_dirty.q.m, "get_queue_size") != 0) {
-        return -1;
-    }
-    int size = g_dirty.q.count;
-    (void)dirty_mutex_unlock(&g_dirty.q.m, "get_queue_size(done)");
-    return size;
-}
-
 void dirty_destroy(void) {
     if (!g_dirty.initialized) {
         return;

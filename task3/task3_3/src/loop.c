@@ -564,10 +564,6 @@ void loop_destroy(void) {
     }
 }
 
-struct ev_loop *loop_get(void) {
-    return g_state.loop;
-}
-
 void loop_notify_dirty(void) {
     if (!g_state.loop) return;
     ev_async_send(g_state.loop, &g_state.async_watcher);

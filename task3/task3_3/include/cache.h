@@ -28,9 +28,4 @@ int cache_trim_to_max(void);
 
 size_t cache_get_max_size(void);
 
-// otladka
-int cache_get_entry_count(void);
-size_t cache_get_total_size(void);
-void cache_print_stats(void);
-
 #endif

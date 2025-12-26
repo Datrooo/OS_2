@@ -11,8 +11,6 @@ void loop_stop(void);
 
 void loop_destroy(void);
 
-struct ev_loop *loop_get(void);
-
 void loop_notify_dirty(void);
 
 int loop_wait_connect(int fd, double timeout_sec, int *out_soerr);

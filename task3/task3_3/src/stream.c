@@ -231,28 +231,6 @@ int stream_send_body(Session *session) {
     return 0;
 }
 
-
-
-size_t stream_get_content_length(CacheEntry *entry) {
-    if (!entry) {
-        return 0;
-    }
-    
-    pthread_mutex_lock(&entry->m);
-    
-    size_t len = 0;
-    
-    if (entry->is_completed) {
-        len = entry->produced;
-    } else if (entry->content_length > 0) {
-        len = entry->content_length;
-    }
-    
-    pthread_mutex_unlock(&entry->m);
-    
-    return len;
-}
-
 int stream_can_send_more(Session *session) {
     if (!session || !session->entry) {
         return 0;
