@@ -25,4 +25,10 @@ run: $(EXECUTABLE)
 debug: CFLAGS += -g -DDEBUG
 debug: clean $(EXECUTABLE)
 
-.PHONY: all clean run debug
+check-unused: CFLAGS += -Werror=unused-function
+check-unused: clean $(EXECUTABLE)
+
+check-unused-vars: CFLAGS += -Werror=unused-variable -Werror=unused-but-set-variable
+check-unused-vars: clean $(EXECUTABLE)
+
+.PHONY: all clean run debug check-unused check-unused-vars
