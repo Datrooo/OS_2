@@ -6,6 +6,7 @@
 
 #include "dirty.h"
 #include "loop.h"
+#include "cache.h"
 
 #define DIRTY_QUEUE_MAX 2048
 
@@ -108,6 +109,7 @@ int dirty_enqueue(CacheEntry *entry) {
     }
     
     g_dirty.q.entries[g_dirty.q.count++] = entry;
+    cache_entry_acquire(entry);
     
     (void)dirty_mutex_unlock(&g_dirty.q.m, "enqueue(done)");
 
@@ -116,7 +118,10 @@ int dirty_enqueue(CacheEntry *entry) {
     return 0;
 }
 
-int dirty_process_all(void) {
+int dirty_process_all(CacheEntry ***out_entries) {
+    if (out_entries) {
+        *out_entries = NULL;
+    }
     if (dirty_mutex_lock(&g_dirty.q.m, "process_all") != 0) {
         return -1;
     }
@@ -163,9 +168,18 @@ int dirty_process_all(void) {
             fprintf(stderr, "[DIRTY] process_all: pthread_mutex_unlock(entry) failed: %s\n", strerror(urc));
         }
     }
-    
-    free(to_process);
-    
+
+    if (!out_entries) {
+        for (int i = 0; i < count; i++) {
+            if (to_process[i]) {
+                cache_entry_release(to_process[i]);
+            }
+        }
+        free(to_process);
+        return count;
+    }
+
+    *out_entries = to_process;
     return count;
 }
 

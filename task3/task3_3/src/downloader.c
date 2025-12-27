@@ -310,6 +310,9 @@ static void *downloader_worker(void *arg) {
         }
 
         if (loop_is_shutting_down()) {
+            if (task.entry) {
+                cache_entry_release(task.entry);
+            }
             break;
         }
         
@@ -365,6 +368,7 @@ static void *downloader_worker(void *arg) {
             entry->is_downloader_running = 0;
             pthread_mutex_unlock(&entry->m);
             dirty_enqueue(entry);
+            cache_entry_release(entry);
             continue;
         }
         
@@ -376,6 +380,7 @@ static void *downloader_worker(void *arg) {
             entry->is_downloader_running = 0;
             pthread_mutex_unlock(&entry->m);
             dirty_enqueue(entry);
+            cache_entry_release(entry);
             continue;
         }
         
@@ -616,6 +621,8 @@ static void *downloader_worker(void *arg) {
         
         fprintf(stdout, "[DL] Worker %d: Entry %lu completed (status: %d, %zu bytes)\n",
                 thread_id, entry->id, response_status, total_received);
+
+        cache_entry_release(entry);
     }
     
     fprintf(stdout, "[DL] Worker thread %d shutting down\n", thread_id);
@@ -693,6 +700,8 @@ int downloader_enqueue(CacheEntry *entry, int urgency) {
         return -1;
     }
     
+    cache_entry_acquire(entry);
+
     DownloadTask task = {
         .entry = entry,
         .urgency = urgency
@@ -701,7 +710,11 @@ int downloader_enqueue(CacheEntry *entry, int urgency) {
     fprintf(stdout, "[DL] Enqueued download task for %s (urgency: %d)\n",
             entry->key.s, urgency);
     
-    return task_queue_enqueue(&task);
+    int qrc = task_queue_enqueue(&task);
+    if (qrc != 0) {
+        cache_entry_release(entry);
+    }
+    return qrc;
 }
 
 void downloader_destroy(void) {

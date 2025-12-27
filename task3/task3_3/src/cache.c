@@ -8,6 +8,7 @@
 
 #include "cache.h"
 #include "gc.h"
+#include "subscribers.h"
 
 typedef struct CacheMap {
     CacheEntry **entries;
@@ -195,9 +196,12 @@ static int entry_can_delete(CacheEntry *entry) {
     if (trc != 0) {
         return 0;
     }
-    int ok = (entry->is_completed && !entry->is_downloader_running && entry->subs_count == 0);
+    int ok = (entry->is_completed && !entry->is_downloader_running);
     (void)cache_mutex_unlock(&entry->m, "entry_can_delete(unlock)");
-    return ok;
+    if (!ok) {
+        return 0;
+    }
+    return (subscriber_count(entry) == 0);
 }
 
 static CacheEntry *find_delete_candidate_locked(void) {
@@ -227,6 +231,7 @@ static CacheEntry *cache_entry_create(const CacheKey *key) {
     entry->key.len = key->len;
     
     entry->id = ++g_cache.entry_id_counter;
+    entry->refcount = 1; // cache map holds 1 reference while in_map==1
     entry->in_map = 1;
     entry->is_downloader_running = 0;
     entry->is_completed = 0;
@@ -242,8 +247,6 @@ static CacheEntry *cache_entry_create(const CacheKey *key) {
     entry->chunks_capacity = 0;
     entry->produced = 0;
     entry->bytes_total = 0;
-    entry->subs_count = 0;
-    entry->subs = NULL;
     entry->is_dirty = 0;
     
     int irc = pthread_mutex_init(&entry->m, NULL);
@@ -257,8 +260,25 @@ static CacheEntry *cache_entry_create(const CacheKey *key) {
     return entry;
 }
 
+static void cache_entry_destroy(CacheEntry *entry);
+
+void cache_entry_acquire(CacheEntry *entry) {
+    if (!entry) return;
+    (void)__atomic_add_fetch(&entry->refcount, 1, __ATOMIC_RELAXED);
+}
+
+void cache_entry_release(CacheEntry *entry) {
+    if (!entry) return;
+    int rc = __atomic_sub_fetch(&entry->refcount, 1, __ATOMIC_ACQ_REL);
+    if (rc == 0) {
+        cache_entry_destroy(entry);
+    }
+}
+
 static void cache_entry_destroy(CacheEntry *entry) {
     if (!entry) return;
+
+    subscriber_forget_entry(entry);
     
     if (entry->key.s) free(entry->key.s);
     if (entry->content_type) free(entry->content_type);
@@ -271,13 +291,6 @@ static void cache_entry_destroy(CacheEntry *entry) {
         }
     }
     if (entry->chunks) free(entry->chunks);
-    
-    SubNode *sub = entry->subs;
-    while (sub) {
-        SubNode *next = sub->hh_next;
-        free(sub);
-        sub = next;
-    }
     
     int drc = pthread_mutex_destroy(&entry->m);
     if (drc != 0) {
@@ -337,6 +350,7 @@ CacheEntry *cache_lookup_or_create(CacheKey *key) {
         fprintf(stdout, "[CACHE] Found existing entry: %s (ID: %lu)\n", 
                 entry->key.s, entry->id);
     }
+    cache_entry_acquire(entry);
     
     (void)cache_mutex_unlock(&g_cache.mutex, "lookup_or_create(unlock)");
     
@@ -564,8 +578,11 @@ void cache_remove_entry(CacheEntry *entry) {
         return;
     }
 
-    lru_remove(entry);
-    cache_map_remove(entry);
+    if (entry->in_map) {
+        lru_remove(entry);
+        cache_map_remove(entry);
+        entry->in_map = 0;
+    }
     if (g_cache.current_size >= freed) {
         g_cache.current_size -= freed;
     } else {
@@ -578,7 +595,7 @@ void cache_remove_entry(CacheEntry *entry) {
 
     (void)cache_mutex_unlock(&g_cache.mutex, "remove_entry(cache_unlock)");
 
-    cache_entry_destroy(entry);
+    cache_entry_release(entry);
 }
 
 void cache_destroy(void) {
@@ -588,14 +605,7 @@ void cache_destroy(void) {
         return;
     }
     
-    CacheEntry *entry = g_cache.lru_head;
-    while (entry) {
-        CacheEntry *next = entry->lru_next;
-        cache_map_remove(entry);
-        cache_entry_destroy(entry);
-        entry = next;
-    }
-    
+    CacheEntry *list = g_cache.lru_head;
     g_cache.lru_head = NULL;
     g_cache.lru_tail = NULL;
     g_cache.map.count = 0;
@@ -608,6 +618,13 @@ void cache_destroy(void) {
     g_cache.map.entries = NULL;
     
     (void)cache_mutex_unlock(&g_cache.mutex, "cleanup(unlock)");
+
+    while (list) {
+        CacheEntry *next = list->lru_next;
+        list->in_map = 0;
+        cache_entry_release(list);
+        list = next;
+    }
     
     fprintf(stdout, "[CACHE] Cleanup complete\n");
 }
@@ -638,6 +655,7 @@ int cache_trim_to_max(void) {
 
         lru_remove(cand);
         cache_map_remove(cand);
+        cand->in_map = 0;
 
         if (g_cache.current_size >= freed) {
             g_cache.current_size -= freed;
@@ -649,7 +667,7 @@ int cache_trim_to_max(void) {
         cache_log_pthread_rc("trim_to_max", "pthread_cond_broadcast", brc);
         (void)cache_mutex_unlock(&g_cache.mutex, "trim_to_max(cache_unlock_before_destroy)");
 
-        cache_entry_destroy(cand);
+        cache_entry_release(cand);
         deleted++;
 
         if (cache_mutex_lock(&g_cache.mutex, "trim_to_max(relock)") != 0) {

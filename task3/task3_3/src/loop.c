@@ -20,6 +20,7 @@
 #include "downloader.h"
 #include "dirty.h"
 #include "stream.h"
+#include "subscribers.h"
 
 static char *xstrdup(const char *s) {
     if (!s) return NULL;
@@ -212,7 +213,8 @@ static void connect_wait_timer_cb(EV_P_ ev_timer *w, int revents) {
 static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
     (void)w;
     (void)revents;
-    int processed = dirty_process_all();
+    CacheEntry **dirty_entries = NULL;
+    int processed = dirty_process_all(&dirty_entries);
 
     ConnectWaitReq *local_head = NULL;
     pthread_mutex_lock(&g_state.connect_q.m);
@@ -238,19 +240,36 @@ static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
     }
 
     if (processed <= 0) {
+        if (dirty_entries) {
+            free(dirty_entries);
+        }
         return;
     }
 
-    SessionNode *node = g_state.sessions;
-    while (node) {
-        Session *s = node->sess;
-        if (s->state == SESSION_STREAMING && s->entry && !s->write_active) {
-            int should_wake = 0;
+    for (int i = 0; i < processed; i++) {
+        CacheEntry *entry = dirty_entries[i];
+        if (!entry) continue;
 
-            pthread_mutex_lock(&s->entry->m);
-            int header_ready = s->entry->header_ready;
-            int completed = s->entry->is_completed;
-            pthread_mutex_unlock(&s->entry->m);
+        Session **sessions = NULL;
+        int n = subscriber_snapshot(entry, &sessions);
+        if (n <= 0) {
+            free(sessions);
+            continue;
+        }
+
+        for (int j = 0; j < n; j++) {
+            Session *s = sessions[j];
+            if (!s) continue;
+
+            if (s->state != SESSION_STREAMING || s->entry != entry || s->write_active) {
+                continue;
+            }
+
+            int should_wake = 0;
+            pthread_mutex_lock(&entry->m);
+            int header_ready = entry->header_ready;
+            int completed = entry->is_completed;
+            pthread_mutex_unlock(&entry->m);
 
             if (!s->header_sent && header_ready) {
                 should_wake = 1;
@@ -267,8 +286,13 @@ static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
                 s->write_active = 1;
             }
         }
-        node = node->next;
+
+        free(sessions);
+
+        cache_entry_release(entry);
     }
+
+    free(dirty_entries);
 }
 
 static void signal_callback(struct ev_loop *loop, ev_signal *w, int revents) {

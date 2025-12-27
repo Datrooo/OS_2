@@ -77,6 +77,7 @@ int session_attach_entry(Session *s, CacheEntry *entry) {
     if (subscriber_add(entry, s) != 0) {
         s->entry = NULL;
         s->cursor = 0;
+        cache_entry_release(entry);
         return -1;
     }
     return 0;
@@ -95,10 +96,16 @@ void session_detach_entry(Session *s) {
     s->cursor = 0;
 
     pthread_mutex_lock(&entry->m);
-    int should_remove = (entry->no_cache && entry->is_completed && entry->subs_count == 0);
+    int should_remove = (entry->no_cache && entry->is_completed);
     pthread_mutex_unlock(&entry->m);
+
+    if (should_remove) {
+        should_remove = (subscriber_count(entry) == 0);
+    }
 
     if (should_remove) {
         cache_remove_entry(entry);
     }
+
+    cache_entry_release(entry);
 }

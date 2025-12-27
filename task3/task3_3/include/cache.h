@@ -7,6 +7,10 @@ int cache_create(size_t max_size);
 
 CacheEntry *cache_lookup_or_create(CacheKey *key);
 
+void cache_entry_acquire(CacheEntry *entry);
+
+void cache_entry_release(CacheEntry *entry);
+
 int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size);
 
 void cache_entry_complete(CacheEntry *entry, int http_status, const char *content_type);

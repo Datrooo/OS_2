@@ -12,7 +12,7 @@ int dirty_create(void);
 
 int dirty_enqueue(CacheEntry *entry);
 
-int dirty_process_all(void);
+int dirty_process_all(CacheEntry ***out_entries);
 
 void dirty_destroy(void);
 

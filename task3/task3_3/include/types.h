@@ -17,14 +17,11 @@ typedef struct {
     uint8_t *data;
 } Chunk;
 
-typedef struct SubNode {
-    struct Session *s;
-    struct SubNode *hh_next;
-} SubNode;
-
 typedef struct CacheEntry {
     CacheKey key;
     uint64_t id;
+
+    int refcount;
     
     int in_map;
     int is_downloader_running;
@@ -51,16 +48,11 @@ typedef struct CacheEntry {
     pthread_mutex_t m;
     int is_dirty;
     
-    SubNode *subs; 
-    int subs_count;
-    
     struct CacheEntry *lru_prev;
     struct CacheEntry *lru_next;
 
     struct CacheEntry *hash_next;
     size_t bytes_total;
-    uint64_t access_time;         // для LRU
-    
 } CacheEntry;
 
 typedef enum {
@@ -104,13 +96,5 @@ typedef struct {
     CacheEntry *entry;
     int urgency;                // 0 = background, 1 = on-demand
 } DownloadTask;
-
-// Очередь для GC (pending free)
-typedef struct {
-    CacheEntry **items;
-    int count;
-    int capacity;
-    pthread_mutex_t m;
-} PendingFreeQueue;
 
 #endif

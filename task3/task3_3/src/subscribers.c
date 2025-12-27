@@ -2,109 +2,201 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <errno.h>
+
 #include "subscribers.h"
 
-#include "types.h"
+typedef struct SubSessionNode {
+    Session *s;
+    struct SubSessionNode *next;
+} SubSessionNode;
 
-static int subs_mutex_lock(pthread_mutex_t *m, const char *ctx) {
-    int rc = pthread_mutex_lock(m);
-    if (rc != 0) {
-        fprintf(stderr, "[SUBS] %s: pthread_mutex_lock failed: %s\n", ctx, strerror(rc));
-        return -1;
+typedef struct EntrySubsNode {
+    CacheEntry *entry;
+    SubSessionNode *head;
+    int count;
+    struct EntrySubsNode *next;
+} EntrySubsNode;
+
+static pthread_mutex_t g_subs_m = PTHREAD_MUTEX_INITIALIZER;
+static EntrySubsNode *g_entries = NULL;
+
+static EntrySubsNode **find_entry_pp(CacheEntry *entry) {
+    EntrySubsNode **pp = &g_entries;
+    while (*pp) {
+        if ((*pp)->entry == entry) {
+            return pp;
+        }
+        pp = &((*pp)->next);
     }
-    return 0;
+    return pp;
 }
 
-static int subs_mutex_unlock(pthread_mutex_t *m, const char *ctx) {
-    int rc = pthread_mutex_unlock(m);
-    if (rc != 0) {
-        fprintf(stderr, "[SUBS] %s: pthread_mutex_unlock failed: %s\n", ctx, strerror(rc));
-        return -1;
+static void free_session_list(SubSessionNode *n) {
+    while (n) {
+        SubSessionNode *next = n->next;
+        free(n);
+        n = next;
     }
-    return 0;
 }
-
 
 int subscriber_add(CacheEntry *entry, Session *session) {
     if (!entry || !session) {
         return -1;
     }
-    
-    if (subs_mutex_lock(&entry->m, "add") != 0) {
+
+    int rc = pthread_mutex_lock(&g_subs_m);
+    if (rc != 0) {
+        fprintf(stderr, "[SUBS] add: pthread_mutex_lock failed: %s\n", strerror(rc));
         return -1;
     }
-    
-    SubNode *existing = entry->subs;
-    while (existing) {
-        if (existing->s == session) {
-            (void)subs_mutex_unlock(&entry->m, "add(already)");
-            fprintf(stdout, "[SUBS] Session %llu already subscribed\n",
-                    (unsigned long long)session->id);
+
+    EntrySubsNode **pp = find_entry_pp(entry);
+    if (!*pp) {
+        *pp = (EntrySubsNode *)calloc(1, sizeof(EntrySubsNode));
+        if (!*pp) {
+            (void)pthread_mutex_unlock(&g_subs_m);
+            return -1;
+        }
+        (*pp)->entry = entry;
+        (*pp)->head = NULL;
+        (*pp)->count = 0;
+        (*pp)->next = NULL;
+    }
+
+    EntrySubsNode *en = *pp;
+    for (SubSessionNode *cur = en->head; cur; cur = cur->next) {
+        if (cur->s == session) {
+            (void)pthread_mutex_unlock(&g_subs_m);
             return 0;
         }
-        existing = existing->hh_next;
     }
-    
-    SubNode *new_sub = malloc(sizeof(SubNode));
-    if (!new_sub) {
-        (void)subs_mutex_unlock(&entry->m, "add(alloc_fail)");
-        fprintf(stderr, "[SUBS] Failed to allocate SubNode\n");
+
+    SubSessionNode *node = (SubSessionNode *)malloc(sizeof(SubSessionNode));
+    if (!node) {
+        (void)pthread_mutex_unlock(&g_subs_m);
         return -1;
     }
-    
-    new_sub->s = session;
-    new_sub->hh_next = entry->subs;
-    entry->subs = new_sub;
-    entry->subs_count++;
-    
-    fprintf(stdout, "[SUBS] Added subscriber (session %llu), total: %d\n",
-            (unsigned long long)session->id, entry->subs_count);
-    
-    (void)subs_mutex_unlock(&entry->m, "add(done)");
-    
+    node->s = session;
+    node->next = en->head;
+    en->head = node;
+    en->count++;
+
+    (void)pthread_mutex_unlock(&g_subs_m);
     return 0;
 }
-
 
 int subscriber_remove(CacheEntry *entry, Session *session) {
     if (!entry || !session) {
         return -1;
     }
-    
-    if (subs_mutex_lock(&entry->m, "remove") != 0) {
+
+    int rc = pthread_mutex_lock(&g_subs_m);
+    if (rc != 0) {
+        fprintf(stderr, "[SUBS] remove: pthread_mutex_lock failed: %s\n", strerror(rc));
         return -1;
     }
-    
-    SubNode *current = entry->subs;
-    SubNode *prev = NULL;
-    
-    while (current) {
-        if (current->s == session) {
-            if (prev) {
-                prev->hh_next = current->hh_next;
-            } else {
-                entry->subs = current->hh_next;
-            }
-            
-            free(current);
-            entry->subs_count--;
-            
-            fprintf(stdout, "[SUBS] Removed subscriber (session %llu), total: %d\n",
-                    (unsigned long long)session->id, entry->subs_count);
-            
-                (void)subs_mutex_unlock(&entry->m, "remove(done)");
-            return 0;
-        }
-        
-        prev = current;
-        current = current->hh_next;
+
+    EntrySubsNode **pp = find_entry_pp(entry);
+    if (!*pp) {
+        (void)pthread_mutex_unlock(&g_subs_m);
+        return 0;
     }
-    
-    fprintf(stderr, "[SUBS] Session %llu not found in subscribers\n",
-            (unsigned long long)session->id);
-    
-    (void)subs_mutex_unlock(&entry->m, "remove(not_found)");
-    return -1;
+
+    EntrySubsNode *en = *pp;
+    SubSessionNode **sp = &en->head;
+    while (*sp) {
+        if ((*sp)->s == session) {
+            SubSessionNode *victim = *sp;
+            *sp = victim->next;
+            free(victim);
+            en->count--;
+            break;
+        }
+        sp = &((*sp)->next);
+    }
+
+    if (en->count <= 0) {
+        *pp = en->next;
+        free_session_list(en->head);
+        free(en);
+    }
+
+    (void)pthread_mutex_unlock(&g_subs_m);
+    return 0;
+}
+
+int subscriber_count(CacheEntry *entry) {
+    if (!entry) return 0;
+
+    int rc = pthread_mutex_lock(&g_subs_m);
+    if (rc != 0) {
+        fprintf(stderr, "[SUBS] count: pthread_mutex_lock failed: %s\n", strerror(rc));
+        return 0;
+    }
+
+    EntrySubsNode **pp = find_entry_pp(entry);
+    int out = (*pp) ? (*pp)->count : 0;
+
+    (void)pthread_mutex_unlock(&g_subs_m);
+    return out;
+}
+
+int subscriber_snapshot(CacheEntry *entry, Session ***out_sessions) {
+    if (out_sessions) {
+        *out_sessions = NULL;
+    }
+    if (!entry || !out_sessions) {
+        return -1;
+    }
+
+    int rc = pthread_mutex_lock(&g_subs_m);
+    if (rc != 0) {
+        fprintf(stderr, "[SUBS] snapshot: pthread_mutex_lock failed: %s\n", strerror(rc));
+        return -1;
+    }
+
+    EntrySubsNode **pp = find_entry_pp(entry);
+    EntrySubsNode *en = (*pp);
+    int n = en ? en->count : 0;
+    if (n <= 0) {
+        (void)pthread_mutex_unlock(&g_subs_m);
+        return 0;
+    }
+
+    Session **arr = (Session **)malloc((size_t)n * sizeof(Session *));
+    if (!arr) {
+        (void)pthread_mutex_unlock(&g_subs_m);
+        return -1;
+    }
+
+    int i = 0;
+    for (SubSessionNode *cur = en->head; cur && i < n; cur = cur->next) {
+        arr[i++] = cur->s;
+    }
+
+    (void)pthread_mutex_unlock(&g_subs_m);
+
+    *out_sessions = arr;
+    return i;
+}
+
+void subscriber_forget_entry(CacheEntry *entry) {
+    if (!entry) return;
+
+    int rc = pthread_mutex_lock(&g_subs_m);
+    if (rc != 0) {
+        fprintf(stderr, "[SUBS] forget_entry: pthread_mutex_lock failed: %s\n", strerror(rc));
+        return;
+    }
+
+    EntrySubsNode **pp = find_entry_pp(entry);
+    if (*pp) {
+        EntrySubsNode *en = *pp;
+        *pp = en->next;
+        free_session_list(en->head);
+        free(en);
+    }
+
+    (void)pthread_mutex_unlock(&g_subs_m);
 }
 
