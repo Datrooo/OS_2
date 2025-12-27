@@ -475,9 +475,13 @@ static void *downloader_worker(void *arg) {
                 entry->http_status = response_status;
                 entry->content_length = content_length;
                 entry->header_ready = 1;
+
+                if (response_status != 200) {
+                    entry->no_cache = 1;
+                }
                 pthread_mutex_unlock(&entry->m);
 
-                if (max_cache_size > 0 && content_length > max_cache_size) {
+                if (response_status == 200 && max_cache_size > 0 && content_length > max_cache_size) {
                     fprintf(stderr,
                             "[DL] Huge object for entry %lu (%s): Content-Length=%zu > cache_max=%zu; aborting\n",
                             entry->id,
@@ -491,7 +495,7 @@ static void *downloader_worker(void *arg) {
 
                 size_t spill = header_buf_len - header_len;
                 if (spill > 0) {
-                    if (max_cache_size > 0 && stored_bytes + spill > max_cache_size) {
+                    if (response_status == 200 && max_cache_size > 0 && stored_bytes + spill > max_cache_size) {
                         fprintf(stderr,
                                 "[DL] Huge object for entry %lu (%s): streamed_bytes=%zu + spill=%zu > cache_max=%zu; aborting\n",
                                 entry->id,
@@ -520,7 +524,7 @@ static void *downloader_worker(void *arg) {
 
                 if ((size_t)n > can_copy) {
                     size_t rem = (size_t)n - can_copy;
-                    if (max_cache_size > 0 && stored_bytes + rem > max_cache_size) {
+                    if (response_status == 200 && max_cache_size > 0 && stored_bytes + rem > max_cache_size) {
                         fprintf(stderr,
                                 "[DL] Huge object for entry %lu (%s): streamed_bytes=%zu + rem=%zu > cache_max=%zu; aborting\n",
                                 entry->id,
@@ -547,7 +551,7 @@ static void *downloader_worker(void *arg) {
                     stored_bytes += rem;
                 }
             } else {
-                if (max_cache_size > 0 && stored_bytes + (size_t)n > max_cache_size) {
+                if (response_status == 200 && max_cache_size > 0 && stored_bytes + (size_t)n > max_cache_size) {
                     fprintf(stderr,
                             "[DL] Huge object for entry %lu (%s): streamed_bytes=%zu + chunk=%zu > cache_max=%zu; aborting\n",
                             entry->id,

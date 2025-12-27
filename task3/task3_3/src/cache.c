@@ -61,6 +61,26 @@ static int cache_mutex_unlock(pthread_mutex_t *m, const char *ctx) {
     return 0;
 }
 
+static int cache_entry_get_no_cache(CacheEntry *entry, const char *ctx) {
+    if (!entry) return 1;
+
+    int rc = pthread_mutex_lock(&entry->m);
+    if (rc != 0) {
+        cache_log_pthread_rc(ctx, "pthread_mutex_lock(entry)", rc);
+        return 1;
+    }
+
+    int out = entry->no_cache;
+
+    rc = pthread_mutex_unlock(&entry->m);
+    if (rc != 0) {
+        cache_log_pthread_rc(ctx, "pthread_mutex_unlock(entry)", rc);
+        return 1;
+    }
+
+    return out;
+}
+
 static unsigned int hash_djb2(const char *str, size_t len) {
     unsigned int hash = 5381;
     for (size_t i = 0; i < len; i++) {
@@ -359,18 +379,19 @@ CacheEntry *cache_lookup_or_create(CacheKey *key) {
 
 int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
     if (!entry || !data || size == 0) return -1;
+    int no_cache = cache_entry_get_no_cache(entry, "append_chunk(read_no_cache)");
 
     if (cache_mutex_lock(&g_cache.mutex, "append_chunk(get_max)") != 0) {
         return -1;
     }
     size_t max_size = g_cache.max_size;
     (void)cache_mutex_unlock(&g_cache.mutex, "append_chunk(get_max_unlock)");
-    if (max_size > 0 && size > max_size) {
+    if (!no_cache && max_size > 0 && size > max_size) {
         fprintf(stderr, "[CACHE] Chunk too large (%zu > %zu), refusing\n", size, max_size);
         return -2;
     }
 
-    if (max_size > 0) {
+    if (!no_cache && max_size > 0) {
         if (cache_mutex_lock(&g_cache.mutex, "append_chunk(space_lock)") != 0) {
             return -1;
         }
@@ -400,7 +421,7 @@ int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
     }
     
     if (cache_mutex_lock(&entry->m, "append_chunk(entry_lock)") != 0) {
-        if (max_size > 0) {
+        if (!no_cache && max_size > 0) {
             if (cache_mutex_lock(&g_cache.mutex, "append_chunk(rollback_lock)") == 0) {
                 if (g_cache.current_size >= size) g_cache.current_size -= size;
                 (void)pthread_cond_broadcast(&g_cache.space_cond);
@@ -427,7 +448,7 @@ int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
     Chunk *chunk = (Chunk *)malloc(sizeof(Chunk));
     if (!chunk) {
         (void)cache_mutex_unlock(&entry->m, "append_chunk(chunk_alloc_fail_unlock)");
-        if (max_size > 0) {
+        if (!no_cache && max_size > 0) {
             if (cache_mutex_lock(&g_cache.mutex, "append_chunk(chunk_alloc_fail_cache_lock)") == 0) {
             g_cache.current_size -= size;
             int brc = pthread_cond_broadcast(&g_cache.space_cond);
@@ -442,7 +463,7 @@ int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
     if (!chunk->data) {
         free(chunk);
         (void)cache_mutex_unlock(&entry->m, "append_chunk(data_alloc_fail_unlock)");
-        if (max_size > 0) {
+        if (!no_cache && max_size > 0) {
             if (cache_mutex_lock(&g_cache.mutex, "append_chunk(data_alloc_fail_cache_lock)") == 0) {
             g_cache.current_size -= size;
             int brc = pthread_cond_broadcast(&g_cache.space_cond);
@@ -458,7 +479,9 @@ int cache_append_chunk(CacheEntry *entry, const uint8_t *data, size_t size) {
     
     entry->chunks[entry->chunks_count++] = chunk;
     entry->produced += size;
-    entry->bytes_total += size;
+    if (!no_cache) {
+        entry->bytes_total += size;
+    }
     entry->is_dirty = 1;
     
     (void)cache_mutex_unlock(&entry->m, "append_chunk(entry_unlock)");
