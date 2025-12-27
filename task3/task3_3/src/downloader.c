@@ -308,6 +308,10 @@ static void *downloader_worker(void *arg) {
         if (task_queue_dequeue(&task) < 0) {
             break;
         }
+
+        if (loop_is_shutting_down()) {
+            break;
+        }
         
         if (!task.entry) {
             continue;
@@ -382,6 +386,7 @@ static void *downloader_worker(void *arg) {
         char *content_type = NULL;
         size_t content_length = 0;
         size_t stored_bytes = 0;
+        int recv_error = 0;
         int aborted = 0;
         size_t max_cache_size = cache_get_max_size();
 
@@ -389,6 +394,12 @@ static void *downloader_worker(void *arg) {
         size_t header_buf_len = 0;
         
         while (1) {
+            if (loop_is_shutting_down()) {
+                fprintf(stdout, "[DL] Worker %d: Shutdown requested, aborting entry %lu\n",
+                        thread_id, entry->id);
+                recv_error = 1;
+                break;
+            }
             ssize_t n = recv(origin_fd, buffer, sizeof(buffer), 0);
             
             if (n < 0) {
@@ -396,6 +407,7 @@ static void *downloader_worker(void *arg) {
                     continue;
                 }
                 fprintf(stderr, "[DL] Worker %d: Recv error: %s\n", thread_id, strerror(errno));
+                recv_error = 1;
                 break;
             }
             
@@ -564,10 +576,29 @@ static void *downloader_worker(void *arg) {
         }
 
         if (!aborted) {
-            if (header_parsed) {
-                cache_entry_complete(entry, response_status, content_type);
-            } else {
+            int should_fail = 0;
+            if (!header_parsed) {
+                should_fail = 1;
+            }
+            if (recv_error) {
+                should_fail = 1;
+            }
+            // If origin promised Content-Length but we didn't get all bytes, treat as failure.
+            if (!should_fail && header_parsed && content_length > 0 && stored_bytes < content_length) {
+                fprintf(stderr,
+                        "[DL] Worker %d: Origin closed early for entry %lu (%s): got %zu/%zu bytes\n",
+                        thread_id,
+                        entry->id,
+                        entry->key.s ? entry->key.s : "(null)",
+                        stored_bytes,
+                        content_length);
+                should_fail = 1;
+            }
+
+            if (should_fail) {
                 cache_entry_failed(entry);
+            } else {
+                cache_entry_complete(entry, response_status, content_type);
             }
         }
         

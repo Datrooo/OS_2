@@ -51,6 +51,8 @@ int stream_format_response_header(CacheEntry *entry,
     const char *reason =
         http_status == 200 ? "OK" :
         http_status == 404 ? "Not Found" :
+        http_status == 502 ? "Bad Gateway" :
+        http_status == 504 ? "Gateway Timeout" :
         http_status == 500 ? "Internal Server Error" :
         "Unknown";
 

@@ -485,11 +485,17 @@ void cache_entry_failed(CacheEntry *entry) {
     if (cache_mutex_lock(&entry->m, "entry_failed") != 0) {
         return;
     }
-    entry->http_status = 500;
+    entry->http_status = 502;
     entry->no_cache = 1;
     entry->header_ready = 1;
     entry->is_failed = 1;
     entry->is_completed = 1;
+
+    if (entry->resp_header) {
+        free(entry->resp_header);
+        entry->resp_header = NULL;
+    }
+    entry->resp_header_len = 0;
     fprintf(stdout, "[CACHE] Entry %lu marked as failed\n", entry->id);
     (void)cache_mutex_unlock(&entry->m, "entry_failed(unlock)");
 }

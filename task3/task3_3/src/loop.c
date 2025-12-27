@@ -67,6 +67,7 @@ typedef struct ConnectWaitQueue {
     pthread_mutex_t m;
     struct ConnectWaitReq *head;
     struct ConnectWaitReq *tail;
+    struct ConnectWaitReq *active;
 } ConnectWaitQueue;
 
 typedef struct LoopState {
@@ -79,6 +80,7 @@ typedef struct LoopState {
     uint64_t session_counter;
     SessionNode *sessions;
     ConnectWaitQueue connect_q;
+    int shutting_down;
 } LoopState;
 
 static LoopState g_state = {
@@ -90,8 +92,14 @@ static LoopState g_state = {
         .m = PTHREAD_MUTEX_INITIALIZER,
         .head = NULL,
         .tail = NULL,
+        .active = NULL,
     },
+    .shutting_down = 0,
 };
+
+int loop_is_shutting_down(void) {
+    return g_state.shutting_down;
+}
 
 static void session_list_add(Session *s) {
     SessionNode *node = (SessionNode *)malloc(sizeof(SessionNode));
@@ -127,6 +135,43 @@ typedef struct ConnectWaitReq {
     struct ConnectWaitReq *next;
 } ConnectWaitReq;
 
+static void connect_wait_finish(ConnectWaitReq *req, int timed_out, int soerr);
+
+static void connect_wait_active_add(ConnectWaitReq *req) {
+    if (!req) return;
+    pthread_mutex_lock(&g_state.connect_q.m);
+    req->next = (ConnectWaitReq *)g_state.connect_q.active;
+    g_state.connect_q.active = req;
+    pthread_mutex_unlock(&g_state.connect_q.m);
+}
+
+static void connect_wait_active_remove(ConnectWaitReq *req) {
+    if (!req) return;
+    pthread_mutex_lock(&g_state.connect_q.m);
+    ConnectWaitReq **pp = (ConnectWaitReq **)&g_state.connect_q.active;
+    while (*pp) {
+        if (*pp == req) {
+            *pp = (*pp)->next;
+            break;
+        }
+        pp = &((*pp)->next);
+    }
+    pthread_mutex_unlock(&g_state.connect_q.m);
+}
+
+static void connect_wait_cancel_list(struct ev_loop *loop, ConnectWaitReq *list, int stop_watchers) {
+    while (list) {
+        ConnectWaitReq *req = list;
+        list = list->next;
+        req->next = NULL;
+        if (stop_watchers && loop) {
+            ev_io_stop(loop, &req->io);
+            ev_timer_stop(loop, &req->timer);
+        }
+        connect_wait_finish(req, 1, ECANCELED);
+    }
+}
+
 static void connect_wait_finish(ConnectWaitReq *req, int timed_out, int soerr) {
     if (!req) return;
     pthread_mutex_lock(&req->m);
@@ -150,6 +195,7 @@ static void connect_wait_io_cb(EV_P_ ev_io *w, int revents) {
 
     ev_io_stop(EV_A_ &req->io);
     ev_timer_stop(EV_A_ &req->timer);
+    connect_wait_active_remove(req);
     connect_wait_finish(req, 0, soerr);
 }
 
@@ -159,6 +205,7 @@ static void connect_wait_timer_cb(EV_P_ ev_timer *w, int revents) {
     if (!req) return;
     ev_io_stop(EV_A_ &req->io);
     ev_timer_stop(EV_A_ &req->timer);
+    connect_wait_active_remove(req);
     connect_wait_finish(req, 1, ETIMEDOUT);
 }
 
@@ -186,6 +233,8 @@ static void async_callback(struct ev_loop *loop, ev_async *w, int revents) {
 
         ev_io_start(loop, &req->io);
         ev_timer_start(loop, &req->timer);
+
+        connect_wait_active_add(req);
     }
 
     if (processed <= 0) {
@@ -226,6 +275,22 @@ static void signal_callback(struct ev_loop *loop, ev_signal *w, int revents) {
     (void)w;
     (void)revents;
     fprintf(stderr, "\nSignal received, shutting down...\n");
+    g_state.shutting_down = 1;
+
+    // Cancel connect-waits to avoid deadlocks (downloader threads may be blocked in loop_wait_connect()).
+    ConnectWaitReq *queued = NULL;
+    ConnectWaitReq *active = NULL;
+    pthread_mutex_lock(&g_state.connect_q.m);
+    queued = (ConnectWaitReq *)g_state.connect_q.head;
+    active = (ConnectWaitReq *)g_state.connect_q.active;
+    g_state.connect_q.head = NULL;
+    g_state.connect_q.tail = NULL;
+    g_state.connect_q.active = NULL;
+    pthread_mutex_unlock(&g_state.connect_q.m);
+
+    connect_wait_cancel_list(loop, active, 1);
+    connect_wait_cancel_list(NULL, queued, 0);
+
     ev_break(loop, EVBREAK_ALL);
 }
 
@@ -497,6 +562,7 @@ static void accept_callback(struct ev_loop *loop, ev_io *w, int revents) {
 }
 
 int loop_create(const char *bind_ip, int listen_port) {
+    g_state.shutting_down = 0;
     g_state.listen_fd = net_listen_on(bind_ip, listen_port);
     if (g_state.listen_fd < 0) {
         fprintf(stderr, "Failed to create listen socket\n");
@@ -541,13 +607,55 @@ int loop_run(void) {
     return 0;
 }
 
-void loop_stop(void) {
-    if (!g_state.loop) return;
-    
-    ev_break(g_state.loop, EVBREAK_ALL);
-}
-
 void loop_destroy(void) {
+    g_state.shutting_down = 1;
+
+    // Close all active client sessions (best-effort).
+    if (g_state.loop) {
+        SessionNode *node = g_state.sessions;
+        while (node) {
+            Session *s = node->sess;
+            if (s) {
+                if (s->read_active) {
+                    ev_io_stop(g_state.loop, &s->read_w);
+                    s->read_active = 0;
+                }
+                if (s->write_active) {
+                    ev_io_stop(g_state.loop, &s->write_w);
+                    s->write_active = 0;
+                }
+                session_free(s);
+            }
+            node = node->next;
+        }
+
+        // Free the list nodes.
+        node = g_state.sessions;
+        while (node) {
+            SessionNode *next = node->next;
+            free(node);
+            node = next;
+        }
+        g_state.sessions = NULL;
+    }
+
+    // Cancel any outstanding connect waits.
+    ConnectWaitReq *queued = NULL;
+    ConnectWaitReq *active = NULL;
+    pthread_mutex_lock(&g_state.connect_q.m);
+    queued = (ConnectWaitReq *)g_state.connect_q.head;
+    active = (ConnectWaitReq *)g_state.connect_q.active;
+    g_state.connect_q.head = NULL;
+    g_state.connect_q.tail = NULL;
+    g_state.connect_q.active = NULL;
+    pthread_mutex_unlock(&g_state.connect_q.m);
+    if (g_state.loop) {
+        connect_wait_cancel_list(g_state.loop, active, 1);
+    } else {
+        connect_wait_cancel_list(NULL, active, 0);
+    }
+    connect_wait_cancel_list(NULL, queued, 0);
+
     if (g_state.loop) {
         ev_signal_stop(g_state.loop, &g_state.sigterm_watcher);
         ev_signal_stop(g_state.loop, &g_state.sigint_watcher);
